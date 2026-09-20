@@ -36122,6 +36122,12 @@ Keep the existing resolved-form wire shape without exposing storage metadata.
 | default_permission_keys | [ string ] |  | No |
 | overrides | [ [ResourcePermissionKeys](#resourcepermissionkeys) ] |  | No |
 
+#### ResourceSelectCard
+
+| Name | Type | Description | Required |
+| ---- | ---- | ----------- | -------- |
+| recommended | [ [ResourceOption](#resourceoption) ] |  | No |
+
 #### ResourceUserAccessPolicies
 
 | Name | Type | Description | Required |
