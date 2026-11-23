@@ -113,11 +113,23 @@ jobs:
           GUARD_BASE_REV: ${{ github.event_name == 'pull_request' && 'HEAD^1' || inputs.base-rev }}
         run: uv run --project api python scripts/check_no_new_cast.py --base-rev "$GUARD_BASE_REV"
 
+      - name: Run No New Deployment Edition Guard
+        if: inputs.run-python-style
+        env:
+          GUARD_BASE_REV: ${{ github.event_name == 'pull_request' && 'HEAD^1' || inputs.base-rev }}
+        run: uv run --project api python scripts/check_no_new_deployment_edition.py --base-rev "$GUARD_BASE_REV"
+
       - name: Run No New Constructor Bypass Guard
         if: inputs.run-python-style
         env:
           GUARD_BASE_REV: ${{ github.event_name == 'pull_request' && 'HEAD^1' || inputs.base-rev }}
         run: uv run --project api python scripts/check_no_new_constructor_bypass.py --base-rev "$GUARD_BASE_REV"
+
+      - name: Run No New Multi String Literal Guard
+        if: inputs.run-python-style
+        env:
+          GUARD_BASE_REV: ${{ github.event_name == 'pull_request' && 'HEAD^1' || inputs.base-rev }}
+        run: uv run --project api python scripts/check_no_new_multi_string_literal.py --base-rev "$GUARD_BASE_REV"
 
       - name: Run No New Test Doubles Guard
         if: inputs.run-python-style || inputs.run-dify-agent-style
