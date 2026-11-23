@@ -41,10 +41,17 @@ WORKDIR /app
 COPY --from=packages /app/ .
 COPY . .
 
+# The `packages` stage resolves against an INCOMPLETE workspace: `cli` is a workspace member in
+# pnpm-workspace.yaml and the lockfile but its package.json is never copied, and web/e2e/sdks are
+# package.json stubs. The resulting layout satisfies Node's resolver but not Turbopack's, which
+# then cannot resolve any dependency of a `packages/*` file (`@orpc/contract`, `@base-ui/react/*`,
+# `cn`) while every `web/` import resolves fine. Re-resolve now that the real workspace is present.
+RUN pnpm install --frozen-lockfile --ignore-scripts --prefer-offline
+
 WORKDIR /app/web
 ENV NODE_OPTIONS="--max-old-space-size=4096"
 ENV pnpm_config_verify_deps_before_run=false
-RUN pnpm build && pnpm build:vinext
+RUN pnpm build
 
 
 # production stage
@@ -60,7 +67,6 @@ ENV PORT=3000
 # Next.js standalone binds to HOSTNAME. Docker defaults it to the container ID, and
 # net.Server.listen() takes an ID like 30889528e495 as a numeric backlog, not a host.
 ENV HOSTNAME=0.0.0.0
-ENV EXPERIMENTAL_ENABLE_VINEXT=false
 ENV NEXT_TELEMETRY_DISABLED=1
 
 # set timezone
@@ -81,7 +87,6 @@ WORKDIR /app
 COPY --from=builder --chown=dify:dify /app/web/public ./targets/next/web/public
 COPY --from=builder --chown=dify:dify /app/web/.next/standalone ./targets/next/
 COPY --from=builder --chown=dify:dify /app/web/.next/static ./targets/next/web/.next/static
-COPY --from=builder --chown=dify:dify /app/web/dist/standalone ./targets/vinext
 
 COPY --chown=dify:dify --chmod=755 web/docker/entrypoint.sh ./entrypoint.sh
 

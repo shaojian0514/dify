@@ -22,6 +22,7 @@ from dify_agent.layers.execution_context import layer as execution_context
 from dify_agent.layers.knowledge import layer as knowledge
 from dify_agent.layers.knowledge_fs import layer as knowledge_fs
 from dify_agent.layers.output import output_layer as output
+from dify_agent.layers.read_media import layer as read_media
 from dify_agent.layers.runtime import layer as runtime
 from dify_agent.layers.shell import layer as shell
 from dify_agent.layers.user_prompt import layer as user_prompt
@@ -48,16 +49,18 @@ REGISTRY: dict[str, ModuleType] = {
     "knowledge": knowledge,
     "knowledge_fs": knowledge_fs,
     "output": output,
+    "read_media": read_media,
 }
 
 _REFERENCES: dict[ModuleType, dict[str, ModuleType]] = {
     llm: {"execution_context": execution_context},
     plugin_tools: {"execution_context": execution_context, "shell": shell},
-    core_tools: {"execution_context": execution_context},
+    core_tools: {"execution_context": execution_context, "shell": shell},
     knowledge: {"execution_context": execution_context},
     knowledge_fs: {"execution_context": execution_context, "shell": shell},
     shell: {"runtime": runtime, "execution_context": execution_context},
     config: {"shell": shell},
+    read_media: {"execution_context": execution_context, "llm": llm, "shell": shell},
 }
 
 
@@ -116,6 +119,10 @@ def load_modules(
         if module is plugin_tools:
             for tool in cast(plugin_tools.Config, cfg).tools:
                 plugin_tools._validate_required_hidden_parameters(tool, tool.parameters)
+        if module is core_tools:
+            for tool in cast(core_tools.Config, cfg).tools:
+                if tool.uses_plugin_parameters:
+                    plugin_tools._validate_required_hidden_parameters(tool, tool.parameters)
         if module is knowledge:
             target = cast(knowledge.Config, cfg).execution_context
             knowledge._build_caller_context(configs[target])

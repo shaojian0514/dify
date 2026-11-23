@@ -1,11 +1,13 @@
 import type { AgentAppPagination } from '@dify/contracts/api/console/agent/types.gen'
 import type { ApiBasedExtensionResponse } from '@dify/contracts/api/console/api-based-extension/types.gen'
 import type { AppSiteResponse } from '@dify/contracts/api/console/apps/types.gen'
+import type { DifyBuilderStreamEventResponse } from '@dify/contracts/api/console/dify-builder/types.gen'
 import type { TagResponse as Tag } from '@dify/contracts/api/console/tags/types.gen'
 import type { MutationFunctionContext, QueryFunctionContext } from '@tanstack/react-query'
 import type { consoleQuery as ConsoleQuery } from '@/service/console'
 import { MutationObserver, QueryClient, QueryObserver } from '@tanstack/react-query'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test'
+import { createDeferred } from '@/test/deferred'
 import { createAgentFixture } from '@/test/fixtures/agent'
 import { createAppDetailFixture, createAppSiteFixture } from '@/test/fixtures/app'
 import { normalizeConsoleOpenAPIURL } from './openapi-url'
@@ -374,7 +376,11 @@ describe('consoleQuery transport context', () => {
   })
 
   it('should not report query cancellation as a transport error', async () => {
-    const request = vi.fn().mockRejectedValue(new DOMException('Aborted', 'AbortError'))
+    const caller = new AbortController()
+    const request = vi.fn().mockImplementation(async () => {
+      caller.abort()
+      throw new DOMException('Aborted', 'AbortError')
+    })
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
     const consoleQuery = await loadConsoleQueryWithRequest(request)
     const queryOptions = consoleQuery.datasets.get.queryOptions({
@@ -382,7 +388,7 @@ describe('consoleQuery transport context', () => {
     })
 
     await Promise.resolve(
-      queryOptions.queryFn({ signal: new AbortController().signal } as QueryFunctionContext),
+      queryOptions.queryFn({ signal: caller.signal } as QueryFunctionContext),
     ).catch(() => undefined)
 
     expect(errorSpy).not.toHaveBeenCalled()
@@ -442,6 +448,64 @@ describe('consoleQuery transport context', () => {
     expect(requestURL.searchParams.getAll('ids')).toEqual(['id-1', 'id-2'])
     expect(requestURL.searchParams.has('ids[0]')).toBe(false)
     expect(requestURL.searchParams.has('ids[1]')).toBe(false)
+  })
+
+  it('should expose Dify Builder restore as a typed streamed query', async () => {
+    const started = {
+      command_id: 'command-1',
+      phase: 'understand' as const,
+      run_status: 'processing',
+      session_id: 'session-1',
+      version: 1,
+    } as const
+    const terminal = {
+      canvas_read_only: false,
+      command_id: 'command-1',
+      conversation_last_seq: -1,
+      interrupted: false,
+      phase: 'clarify' as const,
+      run_status: 'waiting_input' as const,
+      session_id: 'session-1',
+      version: 2,
+    }
+    const request = vi.fn().mockResolvedValue(
+      new Response(
+        [
+          'event: message',
+          `data: ${JSON.stringify({ event: 'command_started', data: started })}`,
+          '',
+          'event: message',
+          `data: ${JSON.stringify({ event: 'command_finished', data: terminal })}`,
+          '',
+          '',
+        ].join('\n'),
+        {
+          status: 200,
+          headers: { 'content-type': 'text/event-stream' },
+        },
+      ),
+    )
+    const consoleQuery = await loadConsoleQueryWithRequest(request)
+    const queryOptions =
+      consoleQuery.difyBuilder.sessions.bySessionId.stream.get.experimental_streamedOptions({
+        input: { params: { session_id: 'session-1' } },
+      })
+
+    const events = await queryOptions.queryFn({
+      client: new QueryClient(),
+      signal: new AbortController().signal,
+    } as QueryFunctionContext)
+
+    expectTypeOf(events[0]!).toExtend<DifyBuilderStreamEventResponse>()
+    expect(events).toEqual([
+      { event: 'command_started', data: started },
+      { event: 'command_finished', data: terminal },
+    ])
+    expect(request).toHaveBeenCalledWith(
+      expect.stringContaining('/dify-builder/sessions/session-1/stream'),
+      expect.any(Object),
+      expect.objectContaining({ fetchCompat: true }),
+    )
   })
 
   it('should serialize KnowledgeFS creator ids as repeated query params', async () => {
@@ -534,6 +598,123 @@ describe('consoleQuery transport context', () => {
       expect.any(Object),
       expect.objectContaining({ fetchCompat: true }),
     )
+  })
+})
+
+describe('console browser error logging', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('does not log a caller-cancelled response body read after JSON headers', async () => {
+    const caller = new AbortController()
+    let markBodyRead: (() => void) | undefined
+    const bodyReadStarted = new Promise<void>((resolve) => {
+      markBodyRead = resolve
+    })
+    let bodyController: ReadableStreamDefaultController<Uint8Array> | undefined
+    const body = new ReadableStream<Uint8Array>(
+      {
+        start(controller) {
+          bodyController = controller
+        },
+        pull() {
+          markBodyRead?.()
+        },
+      },
+      { highWaterMark: 0 },
+    )
+    const request = vi.fn().mockImplementation(async (_url, _init, options) => {
+      const outgoing = options.request as Request
+      outgoing.signal.addEventListener(
+        'abort',
+        () => {
+          bodyController?.error(new DOMException('The operation was aborted.', 'AbortError'))
+        },
+        { once: true },
+      )
+      return new Response(body, {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    })
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const consoleQuery = await loadConsoleQueryWithRequest(request)
+    const query = consoleQuery.agent.byAgentId.buildDraft.get.queryOptions({
+      input: { params: { agent_id: 'agent-1' } },
+    })
+
+    const result = query.queryFn({ signal: caller.signal } as QueryFunctionContext)
+    await bodyReadStarted
+    caller.abort()
+
+    await expect(result).rejects.toMatchObject({ cause: { name: 'AbortError' } })
+    expect(caller.signal.aborted).toBe(true)
+    expect(errorLog).not.toHaveBeenCalled()
+  })
+
+  it('logs malformed JSON response bodies', async () => {
+    const request = vi.fn().mockResolvedValue(
+      new Response('{broken', {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    )
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const consoleQuery = await loadConsoleQueryWithRequest(request)
+    const query = consoleQuery.agent.byAgentId.buildDraft.get.queryOptions({
+      input: { params: { agent_id: 'agent-1' } },
+    })
+
+    await expect(
+      query.queryFn({ signal: new AbortController().signal } as QueryFunctionContext),
+    ).rejects.toMatchObject({ cause: { name: 'SyntaxError' } })
+    expect(errorLog).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    {
+      name: 'direct caller cancellation',
+      error: new DOMException('The operation was aborted.', 'AbortError'),
+      abortCaller: true,
+      expectedLogs: 0,
+    },
+    {
+      name: 'AbortError without caller cancellation',
+      error: new DOMException('The operation was aborted.', 'AbortError'),
+      abortCaller: false,
+      expectedLogs: 1,
+    },
+    {
+      name: 'unrelated failure after caller cancellation',
+      error: new Error('Provider unavailable'),
+      abortCaller: true,
+      expectedLogs: 1,
+    },
+    {
+      name: 'unrelated wrapper with an AbortError cause',
+      error: new Error('Provider unavailable', {
+        cause: new DOMException('The operation was aborted.', 'AbortError'),
+      }),
+      abortCaller: true,
+      expectedLogs: 1,
+    },
+  ])('logs only genuine errors for $name', async ({ error, abortCaller, expectedLogs }) => {
+    const caller = new AbortController()
+    const request = vi.fn().mockImplementation(async () => {
+      if (abortCaller) caller.abort()
+      throw error
+    })
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const consoleQuery = await loadConsoleQueryWithRequest(request)
+    const query = consoleQuery.agent.byAgentId.buildDraft.get.queryOptions({
+      input: { params: { agent_id: 'agent-1' } },
+    })
+
+    await expect(query.queryFn({ signal: caller.signal } as QueryFunctionContext)).rejects.toBe(
+      error,
+    )
+    expect(errorLog).toHaveBeenCalledTimes(expectedLogs)
   })
 })
 
@@ -997,6 +1178,34 @@ describe('consoleQuery app mutation defaults', () => {
 
     expect(synchronized).toBe(true)
   })
+
+  it.each(['success', 'failure'] as const)(
+    'settles the workflow deletion guard after the initiating observer leaves on %s',
+    async (outcome) => {
+      const query = await loadConsoleQuery()
+      const { isAppDeletingOrDeleted } = await import('@/service/app-deletion')
+      const client = createQueryClient()
+      const result = createDeferred<void>()
+      const mutation = new MutationObserver(client, {
+        ...query.apps.byAppId.delete.mutationOptions(),
+        mutationFn: () => result.promise,
+      })
+      const unsubscribe = mutation.subscribe(() => {})
+      const appId = 'deleted-from-another-surface'
+      const completion = mutation.mutate({ params: { app_id: appId } })
+      await vi.waitFor(() => expect(isAppDeletingOrDeleted(appId)).toBe(true))
+      unsubscribe()
+      if (outcome === 'success') {
+        result.resolve()
+        await completion
+        expect(isAppDeletingOrDeleted(appId)).toBe(true)
+      } else {
+        result.reject(new Error('Delete failed'))
+        await expect(completion).rejects.toThrow('Delete failed')
+        expect(isAppDeletingOrDeleted(appId)).toBe(false)
+      }
+    },
+  )
 
   it('should wait for deleted app lists to synchronize without waiting for quota', async () => {
     const consoleQuery = await loadConsoleQuery()
@@ -2456,6 +2665,49 @@ describe('consoleQuery resourceAccessTokens mutation defaults', () => {
 
     expect(invalidateQueries).toHaveBeenCalledTimes(3)
     expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: tokens.get.key() })
+  })
+
+  it('removes every relation for a deleted token from matching list caches', async () => {
+    const consoleQuery = await loadConsoleQuery()
+    const client = createQueryClient()
+    const tokens = consoleQuery.resourceAccessTokens
+    const key = (keyword?: string) =>
+      tokens.get.queryKey({ input: { query: { keyword, page: 1, limit: 20 } } })
+    const deleted = {
+      token_id: 'token-1',
+      relation_id: 'relation-1',
+      created_at: 1,
+      masked_token: 'masked',
+      name: 'Token',
+      resource_type: 'app' as const,
+      resource_id: 'app-1',
+      resource_name: 'App',
+      track_id: 'track-1',
+    }
+    const remaining = { ...deleted, token_id: 'token-2', relation_id: 'relation-3' }
+    const unaffected = { ...tokenList, data: [remaining], total: 1 }
+    client.setQueryData(key(), {
+      ...tokenList,
+      data: [deleted, { ...deleted, relation_id: 'relation-2' }, remaining],
+      total: 2,
+    })
+    client.setQueryData(key('Token'), { ...tokenList, data: [deleted], total: 1 })
+    client.setQueryData(key('Other'), unaffected)
+
+    const mutation = new MutationObserver(
+      client,
+      tokens.byTokenId.relations.byRelationId.delete.mutationOptions({
+        mutationFn: async () => undefined,
+      }),
+    )
+    await mutation.mutate({
+      params: { token_id: deleted.token_id, relation_id: deleted.relation_id },
+    })
+
+    expect(client.getQueryData(key())).toEqual(unaffected)
+    expect(client.getQueryData(key('Token'))).toEqual(tokenList)
+    expect(client.getQueryData(key('Other'))).toEqual(unaffected)
+    expect(client.getQueryState(key('Other'))?.isInvalidated).toBe(true)
   })
 
   it('should leave the token list alone when the mutation fails', async () => {

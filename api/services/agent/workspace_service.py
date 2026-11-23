@@ -12,7 +12,7 @@ import logging
 
 from dify_agent.client import Client
 from dify_agent.protocol import CreateExecutionBindingRequest, DestroyExecutionBindingRequest
-from sqlalchemy import ColumnElement, delete, or_, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.orm import Session
 
 from clients.agent_backend.factory import create_agent_backend_client
@@ -34,8 +34,11 @@ from models.agent import (
     AgentWorkspaceBinding,
     AgentWorkspaceOwnerType,
 )
-from models.workflow import WorkflowNodeExecutionModel
-from repositories.agent_workspace_repository import AgentWorkspaceRepository
+from repositories.agent_workspace_repository import (
+    AgentWorkspaceRepository,
+    validate_binding_generation,
+    workflow_tool_workspace_owned_by_app,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +50,170 @@ class AgentWorkspaceService:
     and use :meth:`get_active_binding`; Agent and Workspace attributes are not
     participant lookup keys.
     """
+
+    @staticmethod
+    def finalize_native_binding(*, session: Session, allocation) -> None:
+        """Finalize an already allocated native resource, with no physical I/O.
+
+        The native owner reserves the same IDs under its invocation/root lock
+        before allocation and calls this only after exact backend confirmation.
+        """
+        from models.agent import AgentWorkspaceOwnerType
+
+        session.add(
+            AgentWorkspace(
+                id=allocation.workspace_id,
+                tenant_id=allocation.tenant_id,
+                app_id=allocation.app_id,
+                owner_type=AgentWorkspaceOwnerType.WORKFLOW_RUN,
+                owner_id=allocation.owner_run_id,
+                owner_scope_key=f"native:{allocation.invocation_id}",
+                backend_workspace_ref=allocation.backend_ref,
+                status=AgentWorkingResourceStatus.ACTIVE,
+                active_guard=1,
+            )
+        )
+        session.add(
+            AgentWorkspaceBinding(
+                id=allocation.binding_id,
+                tenant_id=allocation.tenant_id,
+                app_id=allocation.app_id,
+                workspace_id=allocation.workspace_id,
+                agent_id=allocation.agent_id,
+                base_home_snapshot_id=allocation.home_snapshot_id,
+                agent_config_version_id=allocation.pinned_snapshot_id,
+                agent_config_version_kind=AgentConfigVersionKind.SNAPSHOT,
+                backend_binding_ref=allocation.backend_ref,
+                status=AgentWorkingResourceStatus.ACTIVE,
+            )
+        )
+
+    @staticmethod
+    def finalize_confirmed_recovery_binding(
+        *,
+        session: Session,
+        scope: WorkspaceOwnerScope,
+        predecessor,
+        successor,
+        agent_id: str,
+        pinned_snapshot_id: str,
+        home_snapshot_id: str | None,
+    ) -> None:
+        """Replace one exclusive confirmed participant in the caller's root transaction.
+
+        Exact active IDs, physical refs, pins and workflow owner are required.
+        Retirement is flushed before inserts to release the active-owner unique
+        guard. Failure leaves rollback to the caller; no lifecycle I/O occurs.
+        """
+        if scope.owner_type != AgentWorkspaceOwnerType.WORKFLOW_RUN or (
+            predecessor.binding_id == successor.binding_id
+            or predecessor.workspace_id == successor.workspace_id
+            or predecessor.binding_ref == successor.binding_ref
+            or predecessor.workspace_ref == successor.workspace_ref
+            or successor.workspace_generation != predecessor.workspace_generation + 1
+        ):
+            raise AgentWorkspaceError("confirmed recovery identity mismatch")
+        binding = session.scalar(
+            select(AgentWorkspaceBinding)
+            .where(
+                AgentWorkspaceBinding.id == predecessor.binding_id,
+                AgentWorkspaceBinding.tenant_id == scope.tenant_id,
+                AgentWorkspaceBinding.app_id == scope.app_id,
+                AgentWorkspaceBinding.status == AgentWorkingResourceStatus.ACTIVE,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        workspace = session.scalar(
+            select(AgentWorkspace)
+            .where(
+                AgentWorkspace.id == predecessor.workspace_id,
+                AgentWorkspace.tenant_id == scope.tenant_id,
+                AgentWorkspace.app_id == scope.app_id,
+                AgentWorkspace.status == AgentWorkingResourceStatus.ACTIVE,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if (
+            binding is None
+            or workspace is None
+            or (
+                binding.workspace_id,
+                binding.agent_id,
+                binding.backend_binding_ref,
+                binding.agent_config_version_id,
+                binding.agent_config_version_kind,
+                binding.base_home_snapshot_id,
+                workspace.backend_workspace_ref,
+                workspace.owner_type,
+                workspace.owner_id,
+                workspace.owner_scope_key,
+            )
+            != (
+                predecessor.workspace_id,
+                agent_id,
+                predecessor.binding_ref,
+                pinned_snapshot_id,
+                AgentConfigVersionKind.SNAPSHOT,
+                home_snapshot_id,
+                predecessor.workspace_ref,
+                scope.owner_type,
+                scope.owner_id,
+                scope.owner_scope_key,
+            )
+        ):
+            raise AgentWorkspaceError("confirmed recovery predecessor mismatch")
+        participants = list(
+            session.scalars(
+                select(AgentWorkspaceBinding.id)
+                .where(
+                    AgentWorkspaceBinding.workspace_id == workspace.id,
+                    AgentWorkspaceBinding.tenant_id == scope.tenant_id,
+                    AgentWorkspaceBinding.status == AgentWorkingResourceStatus.ACTIVE,
+                )
+                .with_for_update()
+            )
+        )
+        if participants != [binding.id]:
+            raise AgentWorkspaceError("confirmed recovery requires an exclusive Workspace")
+        if (
+            session.get(AgentWorkspace, successor.workspace_id) is not None
+            or session.get(AgentWorkspaceBinding, successor.binding_id) is not None
+        ):
+            raise AgentWorkspaceError("confirmed recovery reserved identity already exists")
+        now = naive_utc_now()
+        binding.status, binding.retired_at = AgentWorkingResourceStatus.RETIRED, now
+        workspace.status, workspace.retired_at = AgentWorkingResourceStatus.RETIRED, now
+        workspace.active_guard = None
+        session.flush()
+        session.add(
+            AgentWorkspace(
+                id=successor.workspace_id,
+                tenant_id=scope.tenant_id,
+                app_id=scope.app_id,
+                owner_type=scope.owner_type,
+                owner_id=scope.owner_id,
+                owner_scope_key=scope.owner_scope_key,
+                backend_workspace_ref=successor.workspace_ref,
+                status=AgentWorkingResourceStatus.ACTIVE,
+                active_guard=1,
+            )
+        )
+        session.add(
+            AgentWorkspaceBinding(
+                id=successor.binding_id,
+                tenant_id=scope.tenant_id,
+                app_id=scope.app_id,
+                workspace_id=successor.workspace_id,
+                agent_id=agent_id,
+                base_home_snapshot_id=home_snapshot_id,
+                agent_config_version_id=pinned_snapshot_id,
+                agent_config_version_kind=AgentConfigVersionKind.SNAPSHOT,
+                backend_binding_ref=successor.binding_ref,
+                status=AgentWorkingResourceStatus.ACTIVE,
+            )
+        )
 
     @classmethod
     def resolve_active_workspace(cls, *, session: Session, scope: WorkspaceOwnerScope) -> AgentWorkspace | None:
@@ -207,43 +374,8 @@ class AgentWorkspaceService:
 
     @classmethod
     def retire_binding(cls, *, session: Session, tenant_id: str, binding_id: str) -> str | None:
-        binding = session.scalar(
-            select(AgentWorkspaceBinding)
-            .where(
-                AgentWorkspaceBinding.id == binding_id,
-                AgentWorkspaceBinding.tenant_id == tenant_id,
-                AgentWorkspaceBinding.status == AgentWorkingResourceStatus.ACTIVE,
-            )
-            .with_for_update()
-        )
-        if binding is None:
-            return None
-        workspace = session.scalar(
-            select(AgentWorkspace)
-            .where(
-                AgentWorkspace.id == binding.workspace_id,
-                AgentWorkspace.tenant_id == tenant_id,
-                AgentWorkspace.status == AgentWorkingResourceStatus.ACTIVE,
-            )
-            .with_for_update()
-        )
-        now = naive_utc_now()
-        binding.status = AgentWorkingResourceStatus.RETIRED
-        binding.retired_at = now
-        if workspace is not None:
-            other_binding = session.scalar(
-                select(AgentWorkspaceBinding.id).where(
-                    AgentWorkspaceBinding.tenant_id == tenant_id,
-                    AgentWorkspaceBinding.workspace_id == workspace.id,
-                    AgentWorkspaceBinding.status == AgentWorkingResourceStatus.ACTIVE,
-                    AgentWorkspaceBinding.id != binding.id,
-                )
-            )
-            if other_binding is None:
-                workspace.status = AgentWorkingResourceStatus.RETIRED
-                workspace.active_guard = None
-                workspace.retired_at = now
-        return binding.id
+        """Stage retirement of an active binding in the caller's transaction."""
+        return AgentWorkspaceRepository(session=session).retire_binding(tenant_id=tenant_id, binding_id=binding_id)
 
     @classmethod
     def retire_workspace(cls, *, session: Session, tenant_id: str, workspace_id: str) -> str | None:
@@ -253,46 +385,8 @@ class AgentWorkspaceService:
 
     @classmethod
     def retire_all_for_app(cls, *, session: Session, tenant_id: str, app_id: str) -> list[str]:
-        """Retire active app Workspaces, including source-app participants in its Workflow runs."""
-
-        workspaces = session.scalars(
-            select(AgentWorkspace).where(
-                AgentWorkspace.tenant_id == tenant_id,
-                or_(AgentWorkspace.app_id == app_id, cls._workflow_tool_owned_by_app(tenant_id, app_id)),
-                AgentWorkspace.status == AgentWorkingResourceStatus.ACTIVE,
-            )
-        ).all()
-        retired: list[str] = []
-        for workspace in workspaces:
-            workspace_id = cls.retire_workspace(
-                session=session,
-                tenant_id=tenant_id,
-                workspace_id=workspace.id,
-            )
-            if workspace_id is not None:
-                retired.append(workspace_id)
-        return retired
-
-    @staticmethod
-    def _workflow_tool_owned_by_app(tenant_id: str, app_id: str) -> ColumnElement[bool]:
-        """Follow the persisted caller and Binding, independently of optional run-log storage."""
-        return (
-            select(WorkflowNodeExecutionModel.id)
-            .join(
-                AgentWorkspaceBinding,
-                AgentWorkspaceBinding.id == WorkflowNodeExecutionModel.agent_workspace_binding_id,
-            )
-            .where(
-                WorkflowNodeExecutionModel.workflow_tool_owned_by_app(tenant_id=tenant_id, app_id=app_id),
-                WorkflowNodeExecutionModel.workflow_run_id == AgentWorkspace.owner_id,
-                WorkflowNodeExecutionModel.app_id == AgentWorkspace.app_id,
-                AgentWorkspace.owner_type == AgentWorkspaceOwnerType.WORKFLOW_RUN,
-                AgentWorkspaceBinding.tenant_id == tenant_id,
-                AgentWorkspaceBinding.app_id == AgentWorkspace.app_id,
-                AgentWorkspaceBinding.workspace_id == AgentWorkspace.id,
-            )
-            .exists()
-        )
+        """Stage retirement of the active tenant workspaces owned by the App."""
+        return AgentWorkspaceRepository(session=session).retire_all_for_app(tenant_id=tenant_id, app_id=app_id)
 
     @classmethod
     def retire_workflow_run(cls, *, session: Session, tenant_id: str, app_id: str, workflow_run_id: str) -> list[str]:
@@ -300,7 +394,7 @@ class AgentWorkspaceService:
         workspaces = session.scalars(
             select(AgentWorkspace).where(
                 AgentWorkspace.tenant_id == tenant_id,
-                or_(AgentWorkspace.app_id == app_id, cls._workflow_tool_owned_by_app(tenant_id, app_id)),
+                or_(AgentWorkspace.app_id == app_id, workflow_tool_workspace_owned_by_app(tenant_id, app_id)),
                 AgentWorkspace.owner_type == AgentWorkspaceOwnerType.WORKFLOW_RUN,
                 AgentWorkspace.owner_id == workflow_run_id,
                 AgentWorkspace.status.in_((AgentWorkingResourceStatus.ACTIVE, AgentWorkingResourceStatus.RETIRED)),
@@ -466,14 +560,13 @@ class AgentWorkspaceService:
         agent_config_version_id: str,
         agent_config_version_kind: AgentConfigVersionKind,
     ) -> None:
-        if (
-            binding.base_home_snapshot_id != base_home_snapshot_id
-            or binding.agent_config_version_id != agent_config_version_id
-            or binding.agent_config_version_kind != agent_config_version_kind
-        ):
-            raise AgentWorkspaceBindingGenerationMismatchError(
-                "ACTIVE Binding belongs to a different Agent config/Home generation"
-            )
+        """Require an owner-checked binding to match the expected Agent config and Home generation."""
+        validate_binding_generation(
+            binding,
+            base_home_snapshot_id=base_home_snapshot_id,
+            agent_config_version_id=agent_config_version_id,
+            agent_config_version_kind=agent_config_version_kind,
+        )
 
     @staticmethod
     def _client() -> Client:

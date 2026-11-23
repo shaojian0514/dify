@@ -22,6 +22,7 @@ from pydantic_ai.tools import DeferredToolRequests
 from dify_agent.adapters.shell.protocols import ShellCommandResult
 from dify_agent.layers import history
 from dify_agent.layers.dify_plugin import llm_layer
+from dify_agent.agent_stub.protocol import file_reference
 from dify_agent.protocol.schemas import (
     CreateRunRequest,
     RunComposition,
@@ -69,6 +70,83 @@ def run_runner(incoming, services, monkeypatch, stream, *, run_id="test", timeou
     sink = InMemoryRunEventSink()
     runner = AgentRunRunner(sink=sink, request=incoming, run_id=run_id, services=services, run_timeout_seconds=timeout)
     return runner, sink
+
+
+@pytest.mark.anyio
+async def test_read_media_snapshot_events_and_next_turn_model_switch(monkeypatch):
+    from pydantic_ai.messages import ImageUrl
+
+    reference = file_reference("chart-file")
+    inspected = []
+
+    async def first_stream(messages, info):
+        returns = [p for m in messages if isinstance(m, ModelRequest) for p in m.parts if isinstance(p, ToolReturnPart)]
+        if not returns:
+            yield {
+                0: DeltaToolCall(
+                    name="read_media",
+                    json_args='{"file":{"transfer_method":"tool_file",' + f'"reference":"{reference}"' + "}}",
+                    tool_call_id="read",
+                )
+            }
+        else:
+            media = [
+                item
+                for m in messages
+                if isinstance(m, ModelRequest)
+                for p in m.parts
+                if isinstance(p, UserPromptPart) and not isinstance(p.content, str)
+                for item in p.content
+                if isinstance(item, ImageUrl)
+            ]
+            assert len(media) == 1
+            inspected.extend(media)
+            yield "I inspected the chart."
+
+    def metadata(request):
+        assert request.url.path.endswith("/agent/files/download-request")
+        return httpx.Response(
+            200,
+            json={"filename": "chart.png", "mime_type": "image/png", "size": 10, "download_uri": "/files/never-fetch"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(metadata)) as client:
+        services = Services(client, client, inner_api_key="test-inner-key")
+        incoming = request(RunLayerSpec(name="read_media"))
+        next(layer for layer in incoming.composition.layers if layer.name == "llm").config["supported_modalities"] = [
+            "vision"
+        ]
+        first, sink = run_runner(incoming, services, monkeypatch, first_stream, run_id="media-first")
+        await first.run()
+        terminal = sink.events["media-first"][-1]
+        assert isinstance(terminal, RunSucceededEvent)
+        assert len(inspected) == 1
+        snapshot = terminal.data.session_snapshot
+        assert "image-url" in snapshot.model_dump_json()
+        assert "base64" not in snapshot.model_dump_json() and "binary" not in snapshot.model_dump_json()
+        serialized_events = "".join(event.model_dump_json() for event in sink.events["media-first"])
+        assert "image-url" in serialized_events and "base64" not in serialized_events
+
+        async def second_stream(messages, info):
+            assert not any(
+                isinstance(item, ImageUrl)
+                for m in messages
+                if isinstance(m, ModelRequest)
+                for p in m.parts
+                if isinstance(p, UserPromptPart) and not isinstance(p.content, str)
+                for item in p.content
+            )
+            assert "Historical read_media content omitted" in str(messages)
+            assert reference in str(messages)
+            yield "Continued with a text-only model."
+
+        second, sink = run_runner(
+            request(snapshot=snapshot), services, monkeypatch, second_stream, run_id="media-second"
+        )
+        await second.run()
+        assert isinstance(sink.events["media-second"][-1], RunSucceededEvent)
+        assert "image-url" not in sink.events["media-second"][-1].data.session_snapshot.model_dump_json()
+        assert "image-url" in snapshot.model_dump_json()
 
 
 @pytest.mark.anyio
@@ -510,8 +588,13 @@ async def test_invalid_output_schema_fails_before_resource_and_model_io(monkeypa
 @pytest.mark.parametrize("user", ["hello", ""])
 async def test_knowledge_user_context_is_captured_in_history_and_restored_cache(monkeypatch, user):
     calls = []
+    inner_key = "synthetic-ordinary-inner-key"
 
     def handler(request):
+        assert str(request.url) == "http://ordinary-api.invalid/inner/api/knowledge/retrieve"
+        assert request.headers["X-Inner-Api-Key"] == inner_key
+        assert "Authorization" not in request.headers
+        assert "X-Dify-Agent-Run" not in request.headers
         calls.append(request)
         return httpx.Response(200, json={"results": [], "usage": {}})
 
@@ -537,8 +620,10 @@ async def test_knowledge_user_context_is_captured_in_history_and_restored_cache(
         },
     )
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        services = Services(client, client)
+        # This direct runner fixture uses the explicit legacy ordinary API composition.
+        services = Services(client, client, inner_api_url="http://ordinary-api.invalid", inner_api_key=inner_key)
         first, _ = run_runner(request(knowledge, user=user), services, monkeypatch, stream)
+        assert first.request.execution_mode == "ordinary"
         await first.run()
         snapshot = first.terminal_session_snapshot
         saved = history.State.model_validate(snapshot.layers["history"])
@@ -552,6 +637,7 @@ async def test_knowledge_user_context_is_captured_in_history_and_restored_cache(
         second, _ = run_runner(
             request(knowledge, snapshot=snapshot, user=user), services, monkeypatch, stream, run_id="second"
         )
+        assert second.request.execution_mode == "ordinary"
         await second.run()
         assert len(calls) == 1
 

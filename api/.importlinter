@@ -1,5 +1,6 @@
 [importlinter]
 root_packages =
+    clients
     core
     core.rag.extractor.entity
     constants
@@ -16,6 +17,7 @@ root_packages =
     repositories
     tasks
     services
+    runtime_contracts
 include_external_packages = True
 
 [importlinter:contract:domain-boundary]
@@ -38,6 +40,36 @@ forbidden_modules =
     tasks
     werkzeug
 
+[importlinter:contract:moderation-service-boundary]
+name = Strict moderation use cases depend only on plain contracts and injected gateways
+type = forbidden
+source_modules =
+    services.moderation_service
+forbidden_modules =
+    celery
+    configs
+    controllers
+    core
+    extensions
+    flask
+    models
+    repositories
+    sqlalchemy
+    tasks
+    werkzeug
+
+[importlinter:contract:model-moderation-runtime-boundary]
+name = Model assembly and invocation receive moderation through injection rather than application or persistence imports
+type = forbidden
+source_modules =
+    core.model_manager
+    core.workflow.node_runtime
+forbidden_modules =
+    services.moderation_service
+    services.moderation_adapters
+    repositories.api_based_extension_repository
+allow_indirect_imports = True
+
 [importlinter:contract:backend-layers]
 name = Backend modules follow the transport, application, execution-kernel, and shared-library layers
 type = layers
@@ -45,22 +77,15 @@ layers =
     controllers
     services
     core
+    runtime_contracts
     libs
 # Migration baseline: keep every exception exact. The default unmatched-import
 # error makes this list shrink whenever a legacy dependency is removed.
 unmatched_ignore_imports_alerting = error
 ignore_imports =
-    # The Dify node factory composes the Human Input runtime for workflow execution.
-    core.workflow.node_factory -> services.human_input_v2.composition
     # Legacy generators delegate configured file defaults to the application owner during core migration.
     core.app.apps.base_app_generator -> services.app.file_input_defaults
-    core.app.apps.advanced_chat.app_generator -> services.app.file_input_defaults
-    core.app.apps.workflow.app_generator -> services.app.file_input_defaults
     core.app.app_config.easy_ui_based_app.dataset.manager -> services.knowledge.dataset_service
-    core.app.apps.advanced_chat.app_generator -> controllers.console.app.workflow
-    core.app.apps.advanced_chat.app_generator -> services.conversation_service
-    core.app.apps.advanced_chat.app_generator -> services.errors.conversation
-    core.app.apps.advanced_chat.app_generator -> services.workflow_draft_variable_service
     core.app.apps.agent_app.app_generator -> services.agent.composer_service
     core.app.apps.agent_app.app_generator -> services.agent.workspace_service
     core.app.apps.agent_app.app_generator -> services.conversation_service
@@ -72,22 +97,10 @@ ignore_imports =
     core.app.apps.agent_chat.app_generator -> services.conversation_service
     core.app.apps.base_app_generator -> services.workflow_draft_variable_service
     core.app.apps.chat.app_generator -> services.conversation_service
-    core.app.apps.common.workflow_response_converter -> services.variable_truncator
     core.app.apps.message_based_app_generator -> services.errors.app_model_config
     core.app.apps.message_based_app_generator -> services.errors.conversation
     core.app.apps.message_based_app_generator -> services.errors.message
-    core.app.apps.pipeline.pipeline_generator -> services
-    core.app.apps.pipeline.pipeline_generator -> services.knowledge.dataset_service
-    core.app.apps.pipeline.pipeline_generator -> services.data_source.provider_service
-    core.app.apps.pipeline.pipeline_generator -> services.feature_service
-    core.app.apps.pipeline.pipeline_generator -> services.workflow_draft_variable_service
-    core.app.apps.workflow.app_generator -> controllers.console.app.workflow
-    core.app.apps.workflow.app_generator -> services.snippet_generate_service
-    core.app.apps.workflow.app_generator -> services.workflow_draft_variable_service
     # Legacy debug callers delegate input hydration to the application owner during core migration.
-    core.app.apps.workflow_app_runner -> services.workflow_node_variables
-    core.workflow.workflow_entry -> services.workflow_node_variables
-    core.app.apps.workflow_app_runner -> tasks.mail_human_input_delivery_task
     core.app.features.annotation_reply.annotation_reply -> services.annotation_service
     core.app.features.annotation_reply.annotation_reply -> services.knowledge.dataset_service
     core.app.llm.quota -> services.credit_pool_service
@@ -112,15 +125,8 @@ ignore_imports =
     core.repositories.sqlalchemy_workflow_node_execution_repository -> services.variable_truncator
     core.tools.tool_manager -> services
     core.workflow.node_runtime -> services
-    # Node construction delegates datasource dependency assembly to the composition root.
-    core.workflow.node_factory -> extensions.application_services.data_sources
-    # The KnowledgeFS retrieval node is owned by services.knowledge_fs and only wired in here.
-    core.workflow.node_factory -> services.knowledge_fs.knowledge_retrieval_v2.automatic_metadata_filter
-    core.workflow.node_factory -> services.knowledge_fs.knowledge_retrieval_v2.entities
+    core.workflow.workflow_tool_container_handler -> services.workflow_runtime.node_factory
     core.workflow.nodes.agent.message_transformer -> services
-    core.workflow.nodes.agent_v2.agent_node -> services.agent.knowledge_citations
-    core.workflow.nodes.agent_v2.agent_node -> services.agent.prompt_mentions
-    core.workflow.nodes.agent_v2.agent_node -> services.agent.workspace_service
     core.workflow.nodes.agent_v2.dify_tools_builder -> services
     core.workflow.nodes.agent_v2.runtime_feature_manifest -> services.agent.knowledge_datasets
     core.workflow.nodes.agent_v2.runtime_request_builder -> services.agent.prompt_mentions
@@ -146,7 +152,6 @@ ignore_imports =
     libs.oauth_bearer -> models
     libs.rsa -> extensions.ext_storage
     libs.workspace_permission -> services.enterprise.enterprise_service
-    services.app_generate_service -> controllers.console.app.workflow
 
 [importlinter:contract:no-direct-rsa-imports]
 # Note: `libs` itself is deliberately excluded from source_modules -- import-linter's
@@ -378,8 +383,8 @@ allow_indirect_imports = True
 name = Pipeline core depends on its document store port
 type = forbidden
 source_modules =
-    core.app.apps.pipeline.pipeline_generator
-    core.app.apps.pipeline.pipeline_runner
+    services.workflow_runtime.pipeline_generator
+    services.workflow_runtime.pipeline_runner
 forbidden_modules =
     repositories
 allow_indirect_imports = True
@@ -1233,6 +1238,7 @@ allow_indirect_imports = True
 name = Workflow comment application service is framework and persistence neutral
 type = forbidden
 source_modules =
+    services.app.workflow_comment_errors
     services.app.workflow_comment_service
 forbidden_modules =
     configs
@@ -1287,11 +1293,13 @@ forbidden_modules =
     werkzeug
 
 [importlinter:contract:agent-app-access-service-boundary]
-name = Agent App access services and contracts are framework and persistence neutral
+name = Agent App access and Sandbox services and contracts are framework and persistence neutral
 type = forbidden
 source_modules =
     services.app.agent_app_service
     services.app.agent_app_contracts
+    services.agent.sandbox_service
+    services.agent.sandbox_contracts
 forbidden_modules =
     configs
     controllers
@@ -1304,10 +1312,11 @@ forbidden_modules =
 allow_indirect_imports = True
 
 [importlinter:contract:console-agent-api-access-boundary]
-name = Agent API access controller reaches persistence through the composition root
+name = Agent API access and Sandbox controllers reach persistence through the composition root
 type = forbidden
 source_modules =
     controllers.console.agent.api_access
+    controllers.console.app.agent_app_sandbox
 forbidden_modules =
     extensions.ext_database
     models.model
@@ -1362,6 +1371,29 @@ forbidden_modules =
     sqlalchemy
     werkzeug
 
+[importlinter:contract:runtime-contracts-neutrality]
+name = Shared runtime contracts are independent of application and infrastructure owners
+type = forbidden
+source_modules =
+    runtime_contracts
+forbidden_modules =
+    core
+    services
+    controllers
+    extensions
+    models
+    repositories
+    tasks
+
+[importlinter:contract:ordinary-code-execution-client-boundary]
+name = Ordinary code execution client is independent of application and controller owners
+type = forbidden
+source_modules =
+    clients.code_execution
+forbidden_modules =
+    services
+    controllers
+
 [importlinter:contract:annotation-application-boundary]
 name = Annotation application services and contracts are framework and persistence neutral
 type = forbidden
@@ -1379,6 +1411,62 @@ forbidden_modules =
     sqlalchemy
     tasks
     werkzeug
+
+[importlinter:contract:builder-cognition-policy-application-boundary]
+name = Builder cognition policy contracts and service are framework and persistence neutral
+type = forbidden
+source_modules =
+    services.dify_builder.application.cognition_policy
+forbidden_modules =
+    configs
+    controllers
+    extensions
+    flask
+    models
+    repositories
+    sqlalchemy
+    tasks
+    werkzeug
+
+[importlinter:contract:builder-cognition-policy-controller-boundary]
+name = Builder cognition policy transport reaches persistence through its composition root
+type = forbidden
+source_modules =
+    controllers.console.dify_builder_policy
+forbidden_modules =
+    models
+    repositories
+    sqlalchemy
+allow_indirect_imports = True
+
+[importlinter:contract:builder-material-application-boundary]
+name = Builder material intake and prompt records use no direct framework or persistence dependency
+type = forbidden
+source_modules =
+    services.dify_builder.attachment_intake
+    services.dify_builder.attachment_context
+    services.dify_builder.attachment_extraction
+forbidden_modules =
+    configs
+    controllers
+    extensions
+    flask
+    models
+    repositories
+    sqlalchemy
+    tasks
+    werkzeug
+allow_indirect_imports = True
+
+[importlinter:contract:builder-material-controller-boundary]
+name = Builder material transport reaches persistence through its composition root
+type = forbidden
+source_modules =
+    controllers.console.dify_builder
+forbidden_modules =
+    models
+    repositories
+allow_indirect_imports = True
 
 [importlinter:contract:tracing-application-boundary]
 name = Trace pipeline and Agent trace collection services and contracts are framework and persistence neutral
@@ -1665,6 +1753,58 @@ source_modules =
     services.agent.roster_service
 forbidden_modules =
     repositories.agent_roster_repository
+allow_indirect_imports = True
+
+[importlinter:contract:agent-app-repository-boundary]
+name = Agent App persistence depends on Agent contracts rather than service implementations
+type = forbidden
+source_modules =
+    repositories.app.agent_app_repository
+    repositories.app.agent_runtime_app
+forbidden_modules =
+    services.agent
+allow_indirect_imports = True
+ignore_imports =
+    # This neutral store port is covered by the application boundary below.
+    repositories.app.agent_app_repository -> services.agent.build_session_store
+    repositories.app.agent_app_repository -> services.agent.errors
+    repositories.app.agent_app_repository -> services.agent.roster_service
+
+[importlinter:contract:agent-build-session-service-boundary]
+name = Agent Build session use cases and contracts are framework and persistence neutral
+type = forbidden
+source_modules =
+    services.agent.build_session_service
+    services.agent.build_session_store
+forbidden_modules =
+    celery
+    configs
+    controllers
+    core
+    extensions
+    flask
+    models
+    repositories
+    sqlalchemy
+    tasks
+    werkzeug
+allow_indirect_imports = True
+
+[importlinter:contract:console-agent-build-session-boundary]
+name = Agent Build session handlers reach persistence through the composition root
+type = forbidden
+source_modules =
+    controllers.console.agent.build_session
+forbidden_modules =
+    controllers.common.session
+    extensions.ext_database
+    models.agent
+    models.model
+    repositories
+    services.agent.composer_service
+    services.agent.roster_service
+    sqlalchemy
+    tasks
 allow_indirect_imports = True
 
 [importlinter:contract:agent-observability-query-boundary]

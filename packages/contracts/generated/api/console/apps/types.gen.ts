@@ -28,7 +28,8 @@ export type CreateAppPayload = {
   icon_background?: string | null
   icon_type?: IconType | null
   mode: 'advanced-chat' | 'agent-chat' | 'chat' | 'completion' | 'workflow'
-  name: string
+  name?: string | null
+  prompt?: string | null
 }
 
 export type AppDetailWithSite = {
@@ -651,6 +652,21 @@ export type AppImportResponse = {
   imported_dsl_version?: string
   status: ImportStatus
   warnings?: Array<DslImportWarning>
+}
+
+export type DifyBuilderAvailabilityResponse = {
+  available: boolean
+  default_model_id: string | null
+  enabled: boolean
+  fallback_model_ids: Array<string>
+  models: Array<CognitionModelResponse>
+  reason_code: 'builder_disabled' | 'model_availability_unknown' | 'model_unavailable' | null
+  revision: number
+  source: 'explicit' | 'workspace_default'
+}
+
+export type DifyBuilderFeatureUnavailableResponse = {
+  code: 'feature_unavailable'
 }
 
 export type AppExportResponse = {
@@ -1630,6 +1646,12 @@ export type WorkflowPublishResponse = {
   warning?: string | null
 }
 
+export type TriggerNodeLimitExceededError = ErrorResponse & {
+  code: 'trigger_node_limit_exceeded'
+  details?: TriggerNodeLimitDetails
+  status: 403
+}
+
 export type WebhookTriggerResponse = {
   created_at?: string | null
   id: string
@@ -2084,6 +2106,17 @@ export type ConversationVariableResponse = {
   updated_at?: number | null
   value?: string | null
   value_type: string
+}
+
+export type CognitionModelResponse = {
+  completion_params: {
+    [key: string]: unknown
+  }
+  health: 'configured' | 'unavailable' | 'unknown'
+  id: string
+  mode: string
+  name: string
+  provider: string
 }
 
 export type AgentThought = {
@@ -2910,6 +2943,11 @@ export type RecursiveJsonValue =
   | Array<RecursiveJsonValue>
   | null
 
+export type TriggerNodeLimitDetails = {
+  count: number
+  limit: number
+}
+
 export type ModelConfigPartial = {
   created_at?: number | null
   created_by?: string | null
@@ -3013,8 +3051,8 @@ export type AppModelSelectionResponse = {
     [key: string]: JsonValue
   }
   mode?: LlmMode | ''
-  name?: string
-  provider?: string
+  name?: string | null
+  provider?: string | null
   [key: string]: unknown
 }
 
@@ -5187,6 +5225,32 @@ export type GetAppsByAppIdAdvancedChatWorkflowRunsCountResponses = {
 export type GetAppsByAppIdAdvancedChatWorkflowRunsCountResponse =
   GetAppsByAppIdAdvancedChatWorkflowRunsCountResponses[keyof GetAppsByAppIdAdvancedChatWorkflowRunsCountResponses]
 
+export type PostAppsByAppIdAdvancedChatWorkflowsDraftConversationsWorkspacesRetireData = {
+  body?: never
+  path: {
+    app_id: string
+  }
+  query?: never
+  url: '/apps/{app_id}/advanced-chat/workflows/draft/conversations/workspaces/retire'
+}
+
+export type PostAppsByAppIdAdvancedChatWorkflowsDraftConversationsWorkspacesRetireErrors = {
+  401: ErrorResponse
+  403: ErrorResponse
+  404: AppNotFoundError | ErrorResponse
+  default: ErrorResponse
+}
+
+export type PostAppsByAppIdAdvancedChatWorkflowsDraftConversationsWorkspacesRetireError =
+  PostAppsByAppIdAdvancedChatWorkflowsDraftConversationsWorkspacesRetireErrors[keyof PostAppsByAppIdAdvancedChatWorkflowsDraftConversationsWorkspacesRetireErrors]
+
+export type PostAppsByAppIdAdvancedChatWorkflowsDraftConversationsWorkspacesRetireResponses = {
+  204: void
+}
+
+export type PostAppsByAppIdAdvancedChatWorkflowsDraftConversationsWorkspacesRetireResponse =
+  PostAppsByAppIdAdvancedChatWorkflowsDraftConversationsWorkspacesRetireResponses[keyof PostAppsByAppIdAdvancedChatWorkflowsDraftConversationsWorkspacesRetireResponses]
+
 export type PostAppsByAppIdAdvancedChatWorkflowsDraftHumanInputNodesByNodeIdFormPreviewData = {
   body: HumanInputFormPreviewPayload
   path: {
@@ -6647,6 +6711,30 @@ export type PostAppsByAppIdCopyResponses = {
 
 export type PostAppsByAppIdCopyResponse =
   PostAppsByAppIdCopyResponses[keyof PostAppsByAppIdCopyResponses]
+
+export type GetAppsByAppIdDifyBuilderAvailabilityData = {
+  body?: never
+  path: {
+    app_id: string
+  }
+  query?: never
+  url: '/apps/{app_id}/dify-builder/availability'
+}
+
+export type GetAppsByAppIdDifyBuilderAvailabilityErrors = {
+  403: DifyBuilderFeatureUnavailableResponse | ErrorResponse
+  default: ErrorResponse
+}
+
+export type GetAppsByAppIdDifyBuilderAvailabilityError =
+  GetAppsByAppIdDifyBuilderAvailabilityErrors[keyof GetAppsByAppIdDifyBuilderAvailabilityErrors]
+
+export type GetAppsByAppIdDifyBuilderAvailabilityResponses = {
+  200: DifyBuilderAvailabilityResponse
+}
+
+export type GetAppsByAppIdDifyBuilderAvailabilityResponse =
+  GetAppsByAppIdDifyBuilderAvailabilityResponses[keyof GetAppsByAppIdDifyBuilderAvailabilityResponses]
 
 export type GetAppsByAppIdExportData = {
   body?: never
@@ -9555,7 +9643,7 @@ export type PostAppsByAppIdWorkflowsPublishData = {
 }
 
 export type PostAppsByAppIdWorkflowsPublishErrors = {
-  403: PaidPlanRequiredError | ErrorResponse
+  403: PaidPlanRequiredError | TriggerNodeLimitExceededError | ErrorResponse
   404: AppNotFoundError | ErrorResponse
   default: ErrorResponse
 }
@@ -9796,6 +9884,7 @@ export type PostAppsByAppIdWorkflowsByWorkflowIdRestoreData = {
 export type PostAppsByAppIdWorkflowsByWorkflowIdRestoreErrors = {
   400: ErrorResponse
   404: AppNotFoundError | ErrorResponse
+  409: ErrorResponse
   default: ErrorResponse
 }
 

@@ -9,7 +9,6 @@ from controllers.console.wraps import setup_required
 from controllers.inner_api import inner_api_ns
 from controllers.inner_api.plugin.wraps import get_user_tenant, plugin_data
 from controllers.inner_api.wraps import plugin_inner_api_only
-from core.plugin.backwards_invocation.app import PluginAppBackwardsInvocation
 from core.plugin.backwards_invocation.base import BaseBackwardsInvocationResponse
 from core.plugin.backwards_invocation.encrypt import PluginEncrypter
 from core.plugin.backwards_invocation.model import PluginModelBackwardsInvocation
@@ -51,6 +50,7 @@ from models import Account, Tenant
 from models.model import EndUser
 from services.file_request_service import FileRequestService
 from services.plugin.datasource_backwards_invocation import PluginDatasourceBackwardsInvocation
+from services.plugin_app_backwards_invocation import PluginAppBackwardsInvocation
 from services.workflow_run_agg import WorkflowRunAgg
 
 
@@ -491,6 +491,7 @@ class PluginInvokeAppApi(Resource):
     )
     @with_session
     def post(self, session: Session, user_model: Account | EndUser, tenant_model: Tenant, payload: RequestInvokeApp):
+        """Invoke an app after the invocation owner verifies tenant ownership before model work."""
         response = PluginAppBackwardsInvocation.invoke_app(
             execution_driver=WorkflowRunAgg.run,
             session=session,

@@ -7,18 +7,57 @@ import pytest
 from sqlalchemy import event, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from constants.model_template import default_app_templates
+from machinery.context import RequestContext
+from models.account import TenantAccountJoin, TenantAccountRole
 from models.agent import Agent, AgentKind, AgentScope, AgentSource, AgentStatus
-from models.model import App, AppModelConfig
+from models.model import App, AppMode, AppModelConfig
 from repositories.app.agent_app_repository import AgentAppRepository
 from services.agent.roster_service import AgentRosterService
 from services.app.agent_app_contracts import AgentAppNotFoundError
+from services.entities.app_entities import AppCreationSettings, AppListParams, CreateAppParams
+from services.evaluation_service import EvaluationService
+from tests.helpers.unit.model_factories import make_account, make_app, make_tenant
 
 type Resolver = Literal["repository", "roster"]
 
 
+def test_agent_app_creation_uses_the_same_derived_name_for_app_and_agent(
+    sqlite_session_factory: sessionmaker[Session],
+) -> None:
+    account = make_account(account_id="account-1", name="Creator", email="creator@example.com")
+    tenant = make_tenant(tenant_id="tenant-1", name="Workspace")
+    with sqlite_session_factory.begin() as session:
+        session.add_all(
+            [
+                account,
+                tenant,
+                TenantAccountJoin(tenant_id="tenant-1", account_id="account-1", role=TenantAccountRole.OWNER),
+            ]
+        )
+
+    repository = AgentAppRepository(
+        session_factory=sqlite_session_factory,
+        stage_evaluation_cleanup=EvaluationService.stage_target_evaluation_cleanup,
+    )
+    app = repository.create_agent_app(
+        RequestContext("request", None, "account-1", "tenant-1"),
+        CreateAppParams(mode="agent", prompt="Refund approval for ecommerce orders"),
+        AppCreationSettings(app=dict(default_app_templates[AppMode.AGENT]["app"]), model_config=None),
+        default_model=None,
+    )
+    with sqlite_session_factory() as session:
+        agent = session.scalar(select(Agent).where(Agent.app_id == app.id))
+        assert agent is not None
+        assert app.name == agent.name == "Refund approval for ecommerce"
+
+
 @pytest.mark.usefixtures("_inline_agent")
 def test_tracing_owner_rejects_inline_without_materializing_app(sqlite_session_factory: sessionmaker[Session]) -> None:
-    repository = AgentAppRepository(session_factory=sqlite_session_factory)
+    repository = AgentAppRepository(
+        session_factory=sqlite_session_factory,
+        stage_evaluation_cleanup=EvaluationService.stage_target_evaluation_cleanup,
+    )
     with pytest.raises(AgentAppNotFoundError):
         repository.resolve_roster_app_id(tenant_id="tenant-1", agent_id="inline-agent")
     with sqlite_session_factory() as session:
@@ -57,9 +96,9 @@ def resolver(request: pytest.FixtureRequest) -> Resolver:
 
 def resolve_runtime_app(factory: sessionmaker[Session], resolver: Resolver) -> str:
     if resolver == "repository":
-        return AgentAppRepository(session_factory=factory).resolve_runtime_app_id(
-            tenant_id="tenant-1", agent_id="inline-agent"
-        )
+        return AgentAppRepository(
+            session_factory=factory, stage_evaluation_cleanup=EvaluationService.stage_target_evaluation_cleanup
+        ).resolve_runtime_app_id(tenant_id="tenant-1", agent_id="inline-agent")
     with factory() as session:
         return AgentRosterService(session).get_agent_runtime_app_model(tenant_id="tenant-1", agent_id="inline-agent").id
 
@@ -138,3 +177,54 @@ def test_existing_runtime_app_resolution_does_not_commit_the_callers_transaction
         app = session.get(App, app_id)
         assert app is not None
         assert app.name == "Inline Agent"
+
+
+def test_list_apps_does_not_create_build_conversation_for_empty_agent_id(
+    sqlite_session_factory: sessionmaker[Session],
+) -> None:
+    """Historical empty Agent ids must not become owners of Build conversations."""
+    valid_agent = Agent(
+        id="agent-1",
+        tenant_id="tenant-1",
+        name="Valid",
+        description="",
+        agent_kind=AgentKind.DIFY_AGENT,
+        scope=AgentScope.ROSTER,
+        source=AgentSource.AGENT_APP,
+        app_id="app-1",
+        status=AgentStatus.ACTIVE,
+    )
+    empty_id_agent = Agent(
+        id="",
+        tenant_id="tenant-1",
+        name="Broken",
+        description="",
+        agent_kind=AgentKind.DIFY_AGENT,
+        scope=AgentScope.ROSTER,
+        source=AgentSource.AGENT_APP,
+        app_id="app-2",
+        status=AgentStatus.ACTIVE,
+    )
+
+    with sqlite_session_factory.begin() as session:
+        session.add_all(
+            [
+                make_app(app_id="app-1", mode=AppMode.AGENT),
+                make_app(app_id="app-2", mode=AppMode.AGENT),
+                valid_agent,
+                empty_id_agent,
+            ]
+        )
+
+    repository = AgentAppRepository(
+        session_factory=sqlite_session_factory,
+        stage_evaluation_cleanup=EvaluationService.stage_target_evaluation_cleanup,
+    )
+    context = RequestContext("test", None, "account-1", "tenant-1")
+    result = repository.list_apps(context, AppListParams(mode="agent"), accessible_agent_ids=None)
+
+    by_app_id = {item.app.id: item for item in result.data}
+    assert by_app_id["app-1"].agent_id == "agent-1"
+    assert by_app_id["app-1"].debug_conversation_id is not None
+    assert by_app_id["app-2"].agent_id is None
+    assert by_app_id["app-2"].debug_conversation_id is None

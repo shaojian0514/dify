@@ -3,9 +3,10 @@ import type { AgentV2NodeType } from '../types'
 import type { NodeProps, Var } from '@/app/components/workflow/types'
 import { Switch } from '@langgenius/dify-ui/switch'
 import { useTranslation } from 'react-i18next'
+import { v4 as uuid4 } from 'uuid'
 import { useEdgesInteractions } from '@/app/components/workflow/hooks/use-edges-interactions'
 import { useNodeDataUpdate } from '@/app/components/workflow/hooks/use-node-data-update'
-import { useNodesSyncDraft } from '@/app/components/workflow/hooks/use-nodes-sync-draft'
+import { useScheduleDraftSave } from '@/app/components/workflow/hooks/use-schedule-draft-save'
 import { useNodesReadOnly, useWorkflow } from '@/app/components/workflow/hooks/use-workflow'
 import {
   useWorkflowHistory,
@@ -23,7 +24,7 @@ export function AgentOutputRoutes({ id, data }: NodeProps<AgentV2NodeType>) {
   const { nodesReadOnly, getNodesReadOnly } = useNodesReadOnly()
   const { removeBranchEdges } = useEdgesInteractions()
   const { handleNodeDataUpdate } = useNodeDataUpdate()
-  const { handleSyncWorkflowDraft } = useNodesSyncDraft()
+  const { handleSyncWorkflowDraft } = useScheduleDraftSave()
   const { saveStateToHistory } = useWorkflowHistory()
   const { removeUsedVarInNodes } = useWorkflow()
   const routes = data.agent_output_routes
@@ -63,7 +64,7 @@ export function AgentOutputRoutes({ id, data }: NodeProps<AgentV2NodeType>) {
     if (enabled) {
       while (nextList.length < 2)
         nextList.push({
-          id: crypto.randomUUID(),
+          id: uuid4(),
           name: '',
           label: defaultLabel(nextList.length + 1),
         })

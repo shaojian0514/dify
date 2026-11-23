@@ -1,6 +1,12 @@
 name: Main CI Pipeline
 
 on:
+  workflow_dispatch:
+    inputs:
+      base_sha:
+        description: Exact main commit used for branch comparison
+        required: true
+        type: string
   pull_request:
     branches: ['main']
   merge_group:
@@ -70,6 +76,8 @@ jobs:
               - 'scripts/check_no_new_constructor_bypass.py'
               - 'scripts/check_no_new_cast.py'
               - 'scripts/ast_grep_rules/no_new_cast.yml'
+              - 'scripts/check_no_new_multi_string_literal.py'
+              - 'scripts/ast_grep_rules/no_new_multi_string_literal.yml'
               - 'scripts/ast_grep_rules/no_new_constructor_bypass.yml'
               - 'scripts/ast_grep_rules/no_new_base_model.yml'
               - 'scripts/check_no_new_test_doubles.py'
@@ -183,6 +191,8 @@ jobs:
               - 'scripts/check_no_new_constructor_bypass.py'
               - 'scripts/check_no_new_cast.py'
               - 'scripts/ast_grep_rules/no_new_cast.yml'
+              - 'scripts/check_no_new_multi_string_literal.py'
+              - 'scripts/ast_grep_rules/no_new_multi_string_literal.yml'
               - 'scripts/ast_grep_rules/no_new_constructor_bypass.yml'
               - 'scripts/ast_grep_rules/no_new_base_model.yml'
               - 'scripts/check_no_new_test_doubles.py'
@@ -472,7 +482,7 @@ jobs:
       - check-changes
     uses: ./.github/workflows/style.yml
     with:
-      base-rev: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+      base-rev: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || inputs.base_sha }}
       classification-succeeded: ${{ needs.check-changes.result == 'success' }}
       run-python-style: ${{ needs.check-changes.outputs.python-style-changed == 'true' }}
       run-dify-agent-style: ${{ needs.check-changes.outputs.dify-agent-style-changed == 'true' }}

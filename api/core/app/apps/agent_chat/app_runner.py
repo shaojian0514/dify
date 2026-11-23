@@ -23,7 +23,7 @@ from graphon.model_runtime.model_providers.base.large_language_model import Larg
 from models.model import App, Conversation, Message
 
 if TYPE_CHECKING:
-    from core.app.apps.workflow_app_runner import WorkflowRunDriver
+    from runtime_contracts.workflow_driver import WorkflowRunDriver
 
 logger = logging.getLogger(__name__)
 
@@ -164,16 +164,6 @@ class AgentChatAppRunner(AppRunner):
             query=query,
             memory=memory,
         )
-
-        # check hosting moderation
-        hosting_moderation_result = self.check_hosting_moderation(
-            application_generate_entity=application_generate_entity,
-            queue_manager=queue_manager,
-            prompt_messages=prompt_messages,
-        )
-
-        if hosting_moderation_result:
-            return
 
         agent_entity = app_config.agent
         assert agent_entity is not None

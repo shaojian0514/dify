@@ -6,19 +6,28 @@ import type { AppListCreationDialog } from './app-list-creation-modals'
 import type { AppListUrlQuery } from './query-params'
 import { useDebounce } from 'ahooks'
 import { useAtomValue } from 'jotai'
+import dynamic from 'next/dynamic'
 import { throttle, useQueryStates } from 'nuqs'
 import { useCallback, useId, useMemo, useRef, useState } from 'react'
 import { workspacePermissionKeysAtom } from '@/context/permission-state'
+import { useDifyBuilderEnabled } from '@/features/dify-builder/use-enabled'
 import { CheckResultToast } from '@/hooks/use-pay'
 import { hasPermission } from '@/utils/permission'
 import { AppListCatalog } from './app-list-catalog'
 import { AppListCreationModals } from './app-list-creation-modals'
 import { AppListHeader } from './app-list-header'
-import { AppListTagManagementModal } from './app-list-tag-management-modal'
 import { APP_LIST_SEARCH_DEBOUNCE_MS } from './constants'
 import { useDSLDragDrop } from './hooks/use-dsl-drag-drop'
 import { StudioListNavigation } from './list-navigation'
 import { appCreationQueryParsers, appListQueryParsers, serializeAppListQuery } from './query-params'
+
+const TagManagementDialog = dynamic(
+  () =>
+    import('@/features/tag-management/tag-management-dialog').then(
+      (mod) => mod.TagManagementDialog,
+    ),
+  { ssr: false },
+)
 
 // Marks a creation history entry that the list pushed over its own entry, so closing can
 // go back to it. It lives in history.state because Back and Forward restore it with the entry.
@@ -38,6 +47,7 @@ type Props = Readonly<{
 
 export function List({ onCreateLearnDify, onTryLearnDify }: Props) {
   const workspacePermissionKeys = useAtomValue(workspacePermissionKeysAtom)
+  const isBuilderEnabled = useDifyBuilderEnabled()
 
   const [urlQuery, setUrlQuery] = useQueryStates(appListQueryParsers)
   const { category, keywords, creatorIDs, tagIDs, sort_by: sortBy } = urlQuery
@@ -45,7 +55,7 @@ export function List({ onCreateLearnDify, onTryLearnDify }: Props) {
   const dropZoneRef = useRef<HTMLDivElement>(null)
   const scrollViewportRef = useRef<HTMLDivElement>(null)
   const titleId = useId()
-  const [showTagManagementModal, setShowTagManagementModal] = useState(false)
+  const [showTagManagementDialog, setShowTagManagementDialog] = useState(false)
   const [creationQuery, setCreationQuery] = useQueryStates(appCreationQueryParsers)
   // DSL import has no URL; it holds the file dropped on the list, if any.
   const [dslImport, setDSLImport] = useState<{ droppedFile?: File } | null>(null)
@@ -112,14 +122,10 @@ export function List({ onCreateLearnDify, onTryLearnDify }: Props) {
     void setUrlQuery({ sort_by: nextSortBy })
   }
 
-  // Opening pushes a history entry and switching between blank and template replaces it,
-  // so closing (or Back) returns to the list in one step. Blank creation defaults to the
-  // selected category; `mode` is only for links from elsewhere.
   const openCreationDialog = useCallback(
     async (create: 'blank' | 'template') => {
       if (!canCreateApp) return
       const switching = creationQuery.create !== null
-      // Replacing the entry drops its state, so carry the mark over when switching.
       const pushed = !switching || isPushedCreationEntry()
       await setCreationQuery({ create, mode: null }, { history: switching ? 'replace' : 'push' })
       if (pushed) markPushedCreationEntry()
@@ -147,7 +153,7 @@ export function List({ onCreateLearnDify, onTryLearnDify }: Props) {
   const openCreateFromDSLModal = useCallback(() => {
     if (canCreateApp) setDSLImport({})
   }, [canCreateApp])
-  const openTagManagement = useCallback(() => setShowTagManagementModal(true), [])
+  const openTagManagement = useCallback(() => setShowTagManagementDialog(true), [])
 
   return (
     <StudioListNavigation
@@ -177,6 +183,7 @@ export function List({ onCreateLearnDify, onTryLearnDify }: Props) {
             keywords={keywords}
             creatorIDs={creatorIDs}
             sortBy={sortBy}
+            isBuilderEnabled={isBuilderEnabled}
             onCategoryChange={changeCategory}
             onTagIDsChange={changeTagIDs}
             onKeywordsChange={changeKeywords}
@@ -193,6 +200,7 @@ export function List({ onCreateLearnDify, onTryLearnDify }: Props) {
             canCreateApp={canCreateApp}
             dragging={dragging}
             hasActiveFilters={hasActiveFilters}
+            isBuilderEnabled={isBuilderEnabled}
             onCreateBlank={openCreateBlankModal}
             onCreateLearnDify={onCreateLearnDify}
             onCreateTemplate={openCreateTemplateDialog}
@@ -204,16 +212,18 @@ export function List({ onCreateLearnDify, onTryLearnDify }: Props) {
         </div>
 
         <CheckResultToast />
-        <AppListTagManagementModal
-          show={showTagManagementModal}
-          onClose={() => setShowTagManagementModal(false)}
+        <TagManagementDialog
+          type="app"
+          show={showTagManagementDialog}
+          onClose={() => setShowTagManagementDialog(false)}
         />
       </div>
 
       <AppListCreationModals
         canCreateApp={canCreateApp}
-        defaultMode={creationQuery.mode ?? category}
+        defaultMode={creationQuery.mode ?? (category === 'all' ? 'advanced-chat' : category)}
         dialog={creationDialog}
+        isBuilderEnabled={isBuilderEnabled}
         onClose={closeCreationDialog}
         onOpenBlank={openCreateBlankModal}
         onOpenTemplate={openCreateTemplateDialog}

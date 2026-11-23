@@ -1,10 +1,11 @@
 import inspect
 import json
 import logging
-from collections.abc import Callable, Generator, Mapping
+import time
+from collections.abc import Callable, Generator, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any, cast
+from typing import Any, cast, override
 from urllib.parse import unquote
 
 import httpx
@@ -66,6 +67,8 @@ _plugin_daemon_request_timeout_override: ContextVar[httpx.Timeout | None] = Cont
     "plugin_daemon_request_timeout_override",
     default=None,
 )
+_plugin_daemon_metadata_deadline: ContextVar[float | None] = ContextVar("plugin_daemon_metadata_deadline", default=None)
+_PLUGIN_METADATA_MAX_RESPONSE_BYTES = 1024 * 1024
 
 logger = logging.getLogger(__name__)
 
@@ -78,17 +81,59 @@ _httpx_client: httpx.Client = get_pooled_http_client(
 )
 
 
+class _MetadataResponseStream(httpx.SyncByteStream):
+    """Bound metadata raw consumption before HTTPX buffers or decodes lines.
+
+    Only readiness metadata uses this wrapper. Every received chunk checks the
+    body deadline, including blank heartbeats and incomplete lines. A final
+    blocked read remains bounded by its configured HTTPX inactivity timeout.
+    """
+
+    def __init__(self, stream: httpx.SyncByteStream, deadline: float) -> None:
+        self._stream = stream
+        self._deadline = deadline
+
+    def _check_deadline(self) -> None:
+        if time.monotonic() >= self._deadline:
+            raise InvokeServerUnavailableError(description="Plugin model metadata service unavailable.")
+
+    @override
+    def __iter__(self) -> Iterator[bytes]:
+        self._check_deadline()
+        consumed = 0
+        for chunk in self._stream:
+            self._check_deadline()
+            consumed += len(chunk)
+            if consumed > _PLUGIN_METADATA_MAX_RESPONSE_BYTES:
+                raise ValueError("Plugin model metadata response exceeds its byte limit")
+            yield chunk
+            self._check_deadline()
+
+    @override
+    def close(self) -> None:
+        self._stream.close()
+
+
 @contextmanager
-def use_plugin_daemon_request_timeout(timeout_seconds: float) -> Generator[None]:
-    """Temporarily shorten plugin-daemon requests made in the current context."""
+def use_plugin_daemon_request_timeout(
+    timeout_seconds: float, *, metadata_deadline: float | None = None
+) -> Generator[None]:
+    """Temporarily shorten requests; optionally bound schema metadata bodies.
+
+    The optional monotonic deadline applies only to model/schema streams.
+    Other requests and callers without it retain their existing behavior.
+    """
     if timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be greater than zero")
 
     token = _plugin_daemon_request_timeout_override.set(httpx.Timeout(timeout_seconds))
+    metadata_token = _plugin_daemon_metadata_deadline.set(metadata_deadline) if metadata_deadline is not None else None
     try:
         yield
     finally:
         _plugin_daemon_request_timeout_override.reset(token)
+        if metadata_token is not None:
+            _plugin_daemon_metadata_deadline.reset(metadata_token)
 
 
 def _get_plugin_daemon_request_timeout() -> httpx.Timeout | None:
@@ -254,7 +299,18 @@ class BasePluginClient:
 
         try:
             with _httpx_client.stream(**stream_kwargs) as response:
+                metadata_deadline = _plugin_daemon_metadata_deadline.get()
+                metadata_limited = metadata_deadline is not None and path.endswith("/dispatch/model/schema")
+                if metadata_limited:
+                    if not isinstance(response.stream, httpx.SyncByteStream):
+                        raise TypeError("Plugin model metadata requires a synchronous response stream")
+                    response.stream = _MetadataResponseStream(response.stream, metadata_deadline)
+                decoded_bytes = 0
                 for raw_line in response.iter_lines():
+                    if metadata_limited:
+                        decoded_bytes += len(raw_line.encode("utf-8")) if isinstance(raw_line, str) else len(raw_line)
+                        if decoded_bytes > _PLUGIN_METADATA_MAX_RESPONSE_BYTES:
+                            raise ValueError("Plugin model metadata response exceeds its byte limit")
                     if not raw_line:
                         continue
                     line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
@@ -312,6 +368,9 @@ class BasePluginClient:
     ) -> T:
         """
         Make a request to the plugin daemon inner API and return the response as a model.
+
+        Nonzero codes expect a JSON-encoded daemon error. An invalid error message raises
+        ValueError with the original message and code.
         """
         try:
             response = self._request(method, path, headers, data, params, files)
@@ -344,7 +403,7 @@ class BasePluginClient:
 
         if rep.code != 0:
             try:
-                error = PluginDaemonError.model_validate(json.loads(rep.message))
+                error = PluginDaemonError.model_validate_json(rep.message)
             except Exception as e:
                 raise ValueError(f"{rep.message}, code: {rep.code}") from e
 
@@ -367,6 +426,9 @@ class BasePluginClient:
     ) -> Generator[T]:
         """
         Make a stream request to the plugin daemon inner API and yield the response as a model.
+
+        Code -500 expects a JSON-encoded daemon error. An invalid error message raises
+        PluginDaemonInnerError with the original message and code.
         """
         for line in self._stream_request(method, path, params, headers, data, files):
             try:
@@ -385,7 +447,7 @@ class BasePluginClient:
             if rep.code != 0:
                 if rep.code == -500:
                     try:
-                        error = PluginDaemonError.model_validate(json.loads(rep.message))
+                        error = PluginDaemonError.model_validate_json(rep.message)
                     except Exception as e:
                         raise PluginDaemonInnerError(code=rep.code, message=rep.message) from e
 

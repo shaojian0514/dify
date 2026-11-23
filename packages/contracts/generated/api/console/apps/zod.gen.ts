@@ -630,6 +630,15 @@ export const zNewAppResponse = z.object({
 })
 
 /**
+ * DifyBuilderFeatureUnavailableResponse
+ *
+ * Builder is not enabled for the workspace (the shared ``dify_builder_required`` gate).
+ */
+export const zDifyBuilderFeatureUnavailableResponse = z.object({
+  code: z.literal('feature_unavailable'),
+})
+
+/**
  * AppExportResponse
  */
 export const zAppExportResponse = z.object({
@@ -1677,7 +1686,8 @@ export const zCreateAppPayload = z.object({
   icon_background: z.string().nullish(),
   icon_type: zIconType.nullish(),
   mode: z.enum(['advanced-chat', 'agent-chat', 'chat', 'completion', 'workflow']),
-  name: z.string().min(1),
+  name: z.string().min(1).nullish(),
+  prompt: z.string().nullish(),
 })
 
 /**
@@ -2104,6 +2114,36 @@ export const zPaginatedConversationVariableResponse = z.object({
   limit: z.int(),
   page: z.int(),
   total: z.int(),
+})
+
+/**
+ * CognitionModelResponse
+ */
+export const zCognitionModelResponse = z.object({
+  completion_params: z.record(z.string(), z.unknown()),
+  health: z.enum(['configured', 'unavailable', 'unknown']),
+  id: z.string(),
+  mode: z.string(),
+  name: z.string(),
+  provider: z.string(),
+})
+
+/**
+ * DifyBuilderAvailabilityResponse
+ *
+ * The same safe availability projection after App-scoped admission.
+ */
+export const zDifyBuilderAvailabilityResponse = z.object({
+  available: z.boolean(),
+  default_model_id: z.string().nullable(),
+  enabled: z.boolean(),
+  fallback_model_ids: z.array(z.string()),
+  models: z.array(zCognitionModelResponse),
+  reason_code: z
+    .enum(['builder_disabled', 'model_availability_unknown', 'model_unavailable'])
+    .nullable(),
+  revision: z.int(),
+  source: z.enum(['explicit', 'workspace_default']),
 })
 
 export const zAnyJsonValue = z.unknown()
@@ -3178,6 +3218,27 @@ export const zWorkflowDraftVariableResponse = z.object({
 export const zWorkflowDraftVariableListResponse = z.object({
   items: z.array(zWorkflowDraftVariableResponse),
 })
+
+/**
+ * TriggerNodeLimitDetails
+ */
+export const zTriggerNodeLimitDetails = z.object({
+  count: z.int(),
+  limit: z.int(),
+})
+
+/**
+ * TriggerNodeLimitExceededError
+ *
+ * The workflow has more trigger nodes than the workspace plan allows.
+ */
+export const zTriggerNodeLimitExceededError = zErrorResponse.and(
+  z.object({
+    code: z.literal('trigger_node_limit_exceeded'),
+    details: zTriggerNodeLimitDetails.optional(),
+    status: z.literal(403),
+  }),
+)
 
 /**
  * AppAnnotationReplyDisabledResponse
@@ -4365,12 +4426,14 @@ export const zLlmMode = z.enum(['chat', 'completion'])
 
 /**
  * AppModelSelectionResponse
+ *
+ * Readable model selection; missing or null identifiers mean it is not fully configured.
  */
 export const zAppModelSelectionResponse = z.object({
   completion_params: z.record(z.string(), zJsonValue).optional(),
   mode: z.union([zLlmMode, z.literal('')]).optional(),
-  name: z.string().optional(),
-  provider: z.string().optional(),
+  name: z.string().nullish(),
+  provider: z.string().nullish(),
 })
 
 /**
@@ -6819,6 +6882,18 @@ export const zGetAppsByAppIdAdvancedChatWorkflowRunsCountQuery = z.object({
  */
 export const zGetAppsByAppIdAdvancedChatWorkflowRunsCountResponse = zWorkflowRunCountResponse
 
+export const zPostAppsByAppIdAdvancedChatWorkflowsDraftConversationsWorkspacesRetirePath = z.object(
+  {
+    app_id: z.uuid(),
+  },
+)
+
+/**
+ * Workspaces retired
+ */
+export const zPostAppsByAppIdAdvancedChatWorkflowsDraftConversationsWorkspacesRetireResponse =
+  z.void()
+
 export const zPostAppsByAppIdAdvancedChatWorkflowsDraftHumanInputNodesByNodeIdFormPreviewBody =
   zHumanInputFormPreviewPayload
 
@@ -7513,6 +7588,15 @@ export const zPostAppsByAppIdCopyPath = z.object({
 })
 
 export const zPostAppsByAppIdCopyResponse = z.union([zAppDetailWithSite, zAppImportResponse])
+
+export const zGetAppsByAppIdDifyBuilderAvailabilityPath = z.object({
+  app_id: z.uuid(),
+})
+
+/**
+ * Success
+ */
+export const zGetAppsByAppIdDifyBuilderAvailabilityResponse = zDifyBuilderAvailabilityResponse
 
 export const zGetAppsByAppIdExportPath = z.object({
   app_id: z.uuid(),

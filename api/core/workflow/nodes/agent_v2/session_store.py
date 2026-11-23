@@ -244,6 +244,52 @@ class WorkflowAgentWorkspaceStore:
                 )
             return self._stored(session, scope, binding)
 
+    @staticmethod
+    def rebind_confirmed_node_execution(
+        *,
+        session: Session,
+        scope: WorkflowAgentSessionScope,
+        predecessor_binding_id: str,
+        successor_binding_id: str,
+    ) -> None:
+        """CAS the exact caller inside an existing root transaction, without polling.
+
+        Requires the complete caller/process identity and exclusive predecessor
+        execution participant. Failure performs no rebind; caller owns rollback.
+        """
+        execution = session.scalar(
+            select(WorkflowNodeExecutionModel)
+            .where(
+                WorkflowNodeExecutionModel.id == scope.node_execution_id,
+                WorkflowNodeExecutionModel.tenant_id == scope.tenant_id,
+                WorkflowNodeExecutionModel.app_id == scope.app_id,
+                WorkflowNodeExecutionModel.workflow_id == scope.workflow_id,
+                WorkflowNodeExecutionModel.workflow_run_id == scope.workflow_run_id,
+                WorkflowNodeExecutionModel.node_id == scope.node_id,
+                WorkflowNodeExecutionModel.agent_workspace_binding_id == predecessor_binding_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        participants = list(
+            session.scalars(
+                select(WorkflowNodeExecutionModel.id)
+                .where(
+                    WorkflowNodeExecutionModel.agent_workspace_binding_id == predecessor_binding_id,
+                )
+                .with_for_update()
+            )
+        )
+        if execution is None or participants != [scope.node_execution_id]:
+            raise AgentWorkspaceNotFoundError("confirmed recovery caller mismatch")
+        process = execution.process_data_dict
+        if not isinstance(process, dict) or (
+            process.get("workflow_agent_binding_id"),
+            process.get(WORKFLOW_TOOL_INVOCATION_ID_KEY),
+        ) != (scope.workflow_agent_binding_id, scope.workflow_tool_invocation_id):
+            raise AgentWorkspaceNotFoundError("confirmed recovery caller identity mismatch")
+        execution.agent_workspace_binding_id = successor_binding_id
+
     def save_active_snapshot(
         self,
         *,
@@ -268,6 +314,15 @@ class WorkflowAgentWorkspaceStore:
             )
             session.commit()
         return retired
+
+    def retire_standalone_node_execution(self, *, tenant_id: str, app_id: str, node_execution_id: str) -> list[str]:
+        """Retire a run-less node execution's Workspaces, commit, and return IDs for collection.
+
+        Standalone single-step previews have no Workflow Run, so
+        ``resolve_workflow_agent_workspace_owner_scope`` owns their Workspaces by
+        ``node_execution_id`` under the ``WORKFLOW_RUN`` owner type.
+        """
+        return self.retire_workflow_run(tenant_id=tenant_id, app_id=app_id, workflow_run_id=node_execution_id)
 
     @staticmethod
     def _load_execution(*, session: Session, scope: WorkflowAgentSessionScope) -> WorkflowNodeExecutionModel:

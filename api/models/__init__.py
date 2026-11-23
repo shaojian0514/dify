@@ -57,6 +57,18 @@ from .dataset import (
     TidbAuthBinding,
     Whitelist,
 )
+from .dify_builder import (
+    DifyBuilderCheckpoint,
+    DifyBuilderConversationItem,
+    DifyBuilderRun,
+    DifyBuilderSession,
+    DifyBuilderSessionCommit,
+    DifyBuilderSnapshot,
+    DifyBuilderTestInput,
+)
+from .dify_builder_cognition_policy import DifyBuilderCognitionPolicy
+from .dify_builder_material import DifyBuilderMaterial
+from .dify_builder_native_code import NativeCodePhysicalOperation
 from .enums import (
     AppTriggerStatus,
     AppTriggerType,
@@ -316,6 +328,15 @@ __all__ = [
     "DatasetRetrieverResource",
     "DatasourceOauthParamConfig",
     "DatasourceProvider",
+    "DifyBuilderCheckpoint",
+    "DifyBuilderCognitionPolicy",
+    "DifyBuilderConversationItem",
+    "DifyBuilderMaterial",
+    "DifyBuilderRun",
+    "DifyBuilderSession",
+    "DifyBuilderSessionCommit",
+    "DifyBuilderSnapshot",
+    "DifyBuilderTestInput",
     "DifySetup",
     "Document",
     "DocumentSegment",
@@ -411,6 +432,7 @@ __all__ = [
     "MessageChain",
     "MessageFeedback",
     "MessageFile",
+    "NativeCodePhysicalOperation",
     "OAuthAccessToken",
     "OperationLog",
     "PermissionEnum",
@@ -464,6 +486,7 @@ __all__ = [
     "WorkflowComment",
     "WorkflowCommentMention",
     "WorkflowCommentReply",
+    "WorkflowDraftCoordination",
     "WorkflowKind",
     "WorkflowNodeExecutionModel",
     "WorkflowNodeExecutionOffload",
@@ -479,3 +502,15 @@ __all__ = [
     "WorkflowVersionCounter",
     "resolve_workflow_kind",
 ]
+
+from .dify_builder_native_tests import (  # noqa: F401
+    NativeContinuation,
+    NativeEffectAttempt,
+    NativeEffectGrant,
+    NativeEffectOperation,
+    NativeEffectOutcome,
+    NativePendingAction,
+    NativeTestInvocation,
+    NativeTestScope,
+)
+from .workflow_draft_coordination import WorkflowDraftCoordination

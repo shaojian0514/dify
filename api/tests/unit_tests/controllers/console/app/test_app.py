@@ -1,3 +1,11 @@
+"""App request contracts and serialization of materialized response data.
+
+Unit coverage for console app controller contracts and response mapping.
+
+Transport contracts for the Console app application boundary.
+
+Regression tests for CreateAppPayload mode validation."""
+
 from __future__ import annotations
 
 import inspect
@@ -26,37 +34,17 @@ from werkzeug.datastructures import MultiDict
 from werkzeug.exceptions import BadRequest, Forbidden, NotFound
 
 from controllers.console import flask_admission
-from controllers.console.app import (
-    annotation as annotation_module,
-)
-from controllers.console.app import (
-    app as app_module,
-)
+from controllers.console.app import annotation as annotation_module
+from controllers.console.app import app as app_module
 from controllers.console.app import app as controller
-from controllers.console.app import (
-    completion as completion_module,
-)
-from controllers.console.app import (
-    message as message_module,
-)
-from controllers.console.app import (
-    ops_trace as ops_trace_module,
-)
-from controllers.console.app import (
-    site as site_module,
-)
-from controllers.console.app import (
-    statistic as statistic_module,
-)
-from controllers.console.app import (
-    workflow_app_log as workflow_app_log_module,
-)
-from controllers.console.app import (
-    workflow_draft_variable as workflow_draft_variable_module,
-)
-from controllers.console.app import (
-    wraps as wraps_module,
-)
+from controllers.console.app import completion as completion_module
+from controllers.console.app import message as message_module
+from controllers.console.app import ops_trace as ops_trace_module
+from controllers.console.app import site as site_module
+from controllers.console.app import statistic as statistic_module
+from controllers.console.app import workflow_app_log as workflow_app_log_module
+from controllers.console.app import workflow_draft_variable as workflow_draft_variable_module
+from controllers.console.app import wraps as wraps_module
 from controllers.console.app.app import CreateAppPayload
 from controllers.console.app.completion import ChatMessagePayload, CompletionMessagePayload
 from controllers.console.app.error import (
@@ -122,11 +110,10 @@ from services.entities.app_entities import (
 from services.entities.dsl_entities import Import, ImportStatus
 from tests.helpers.unit.config_override import apply_config_overrides
 
-"""Unit coverage for console app controller contracts and response mapping."""
-
-
 _APP_APIS_APP_ID = "11111111-1111-1111-1111-111111111111"
+
 _APP_APIS_TENANT_ID = "22222222-2222-2222-2222-222222222222"
+
 USER_ID = "33333333-3333-3333-3333-333333333333"
 
 
@@ -678,19 +665,22 @@ class TestAppApisCases:
             assert all(p is not None for p in payloads)
 
 
-"""App request contracts and serialization of materialized response data."""
-
-
 def _ts(hour: int = 12) -> datetime:
     return datetime(2024, 1, 1, hour, 0, 0)
 
 
 _APP_RESPONSE_MODELS_TENANT_ID = "00000000-0000-0000-0000-000000000001"
+
 _APP_RESPONSE_MODELS_APP_ID = "00000000-0000-0000-0000-000000000101"
+
 ACCOUNT_ID = "00000000-0000-0000-0000-000000000201"
+
 CONFIG_ID = "00000000-0000-0000-0000-000000000301"
+
 WORKFLOW_ID = "00000000-0000-0000-0000-000000000401"
+
 SITE_ID = "00000000-0000-0000-0000-000000000501"
+
 TAG_ID = "00000000-0000-0000-0000-000000000601"
 
 
@@ -864,21 +854,17 @@ class TestAppResponseModelsCases:
                 ("page", "2"),
                 ("limit", "50"),
                 ("mode", "chat"),
-                ("name", "Sales Copilot"),
+                ("name", "Sales DifyBuilder"),
                 ("is_created_by_me", "true"),
             ]
         )
-
         query = app_module.query_params_from_request(
-            app_module.AppListQuery,
-            list_fields=app_module.APP_LIST_QUERY_ARRAY_FIELDS,
-            args=query_args,
+            app_module.AppListQuery, list_fields=app_module.APP_LIST_QUERY_ARRAY_FIELDS, args=query_args
         )
-
         assert query.page == 2
         assert query.limit == 50
         assert query.mode == "chat"
-        assert query.name == "Sales Copilot"
+        assert query.name == "Sales DifyBuilder"
         assert query.is_created_by_me is True
         assert query.tag_ids is None
 
@@ -1102,6 +1088,58 @@ class TestAppResponseModelsCases:
         assert serialized["data"][1]["icon_url"] is None
 
     @staticmethod
+    @pytest.mark.parametrize(
+        "selection",
+        [
+            {"provider": None, "name": None, "mode": "chat", "completion_params": {}},
+            {"provider": "openai", "name": None},
+            {"mode": "chat", "completion_params": {}},
+            {},
+            None,
+            {"provider": "openai", "name": "gpt-4o"},
+        ],
+    )
+    def test_list_and_detail_preserve_unset_model_selection(
+        app: Flask, monkeypatch: pytest.MonkeyPatch, sqlite_session: Session, selection: dict[str, object] | None
+    ) -> None:
+        """Stored unset selections remain readable without changing configuration or hiding apps."""
+        app_obj = _persist_response_graph(sqlite_session)
+        app_obj.mode = AppMode.AGENT_CHAT
+        config = sqlite_session.get(AppModelConfig, CONFIG_ID)
+        assert config is not None
+        stored_model = json.dumps(selection) if selection is not None else None
+        config.model = stored_model
+        sqlite_session.commit()
+        monkeypatch.setattr(
+            "repositories.app.response.load_annotation_reply_config", lambda _session, _app_id: {"enabled": False}
+        )
+        configured = replace(
+            app_record(app_obj, session=sqlite_session),
+            id="00000000-0000-0000-0000-000000000112",
+            app_model_config={"model": {"provider": "openai", "name": "gpt-4o"}},
+        )
+        without_config = replace(configured, id="00000000-0000-0000-0000-000000000113", app_model_config=None)
+        detail = app_record(app_obj, session=sqlite_session, projection="detail-with-site")
+        service = AppBoundary(
+            record=detail, records=[configured, without_config, app_record(app_obj, session=sqlite_session)]
+        )
+        monkeypatch.setattr(controller, "application_services", lambda: Services(AppServices(service)))
+
+        with app.test_request_context("/"):
+            data, status = unwrap(controller.AppListApi.get)(controller.AppListApi(), CONTEXT)
+            response = unwrap(controller.AppApi.get)(controller.AppApi(), CONTEXT, app_id=UUID(app_obj.id))
+
+        assert status == 200
+        assert [item["id"] for item in data["data"]] == [configured.id, without_config.id, app_obj.id]
+        assert data["data"][0]["model_config"]["model"] == {"provider": "openai", "name": "gpt-4o"}
+        assert data["data"][1]["model_config"] is None
+        assert data["data"][2]["model_config"]["model"] == (selection if selection is not None else {})
+        assert response["model_config"]["model"] == (selection if selection is not None else {})
+        assert response["model_config"]["pre_prompt"] == "hello"
+        sqlite_session.expire(config)
+        assert config.model == stored_model
+
+    @staticmethod
     @pytest.mark.parametrize("strategy", [None, "cot", "function-calling"])
     def test_app_detail_preserves_historical_agent_strategy(
         app: Flask, monkeypatch: pytest.MonkeyPatch, sqlite_session: Session, strategy: str | None
@@ -1261,17 +1299,18 @@ class TestAppResponseModelsCases:
             {"dataset_configs": {"retrieval_model": "unsupported"}},
             {"dataset_configs": {"retrieval_model": "multiple", "reranking_mode": "unsupported"}},
             {"model": {"provider": "openai", "name": "gpt-4o", "mode": "unsupported"}},
+            {"model": {"provider": 123, "name": "gpt-4o"}},
+            {"model": {"provider": "openai", "name": ["gpt-4o"]}},
             {"user_input_form": [{"unsupported": {"label": "Name", "variable": "name"}}]},
         ):
             with pytest.raises(ValidationError):
                 app_fields.AppDetailWithSite.model_validate({**detail, "model_config": {**config, **invalid}})
 
 
-"""Transport contracts for the Console app application boundary."""
-
-
 _CONSOLE_APP_API_APP_ID = UUID("11111111-1111-1111-1111-111111111111")
+
 CONTEXT = RequestContext("request", "trace", "actor", "workspace")
+
 RECORD = AppRecord(
     str(_CONSOLE_APP_API_APP_ID),
     "Example",
@@ -1280,6 +1319,7 @@ RECORD = AppRecord(
     created_at=datetime(2024, 1, 1),
     updated_at=datetime(2024, 1, 1),
 )
+
 SITE = {
     "code": "site",
     "title": "Example",
@@ -1312,10 +1352,11 @@ class AppBoundary:
     status: ImportStatus = ImportStatus.COMPLETED
     exported: str | RosterAgentPackageExport = "dsl"
     record: AppRecord = RECORD
+    records: list[AppRecord] = app_field(default_factory=lambda: [RECORD])
 
     def list_apps(self, context: RequestContext, params: AppListParams | StarredAppListParams) -> AppPage:
         self.calls.append(("list", context, params))
-        return AppPage(params.page, params.limit, 1, False, [RECORD])
+        return AppPage(params.page, params.limit, len(self.records), False, self.records)
 
     def create(self, context: RequestContext, params: CreateAppParams) -> AppRecord:
         self.calls.append(("create", context, params))
@@ -1373,6 +1414,50 @@ class TestConsoleAppApiCases:
         boundary = AppBoundary()
         monkeypatch.setattr(controller, "application_services", lambda: Services(AppServices(boundary)))
         return boundary
+
+    @staticmethod
+    @pytest.mark.parametrize("body", [{}, {"prompt": "Build a workflow"}, {"name": None}, {"name": ""}])
+    def test_create_requires_a_name_without_builder(
+        app: Flask, boundary: AppBoundary, config_overrides: Callable[..., None], body: dict[str, object]
+    ) -> None:
+        from werkzeug.exceptions import UnprocessableEntity
+
+        config_overrides(DIFY_BUILDER_ENABLED=False)
+        with (
+            app.test_request_context(method="POST", json={"mode": "workflow", **body}),
+            pytest.raises(UnprocessableEntity) as error,
+        ):
+            invoke(controller.AppListApi, controller.AppListApi.post)
+        assert json.loads(error.value.description)[0]["loc"] == ["name"]
+        assert boundary.calls == []
+
+    @staticmethod
+    @pytest.mark.parametrize(
+        ("enabled", "body", "expected_name", "expected_prompt"),
+        [
+            (False, {"name": "Named", "prompt": {"ignored": True}}, "Named", None),
+            (True, {"name": "Named", "prompt": "Build a workflow"}, "Named", "Build a workflow"),
+            (True, {"prompt": "Build a workflow"}, None, "Build a workflow"),
+            (True, {}, None, None),
+        ],
+    )
+    def test_create_routes_by_builder_setting(
+        app: Flask,
+        boundary: AppBoundary,
+        config_overrides: Callable[..., None],
+        enabled: bool,
+        body: dict[str, object],
+        expected_name: str | None,
+        expected_prompt: str | None,
+    ) -> None:
+        config_overrides(DIFY_BUILDER_ENABLED=enabled)
+        with app.test_request_context(method="POST", json={"mode": "workflow", **body}):
+            response = invoke(controller.AppListApi, controller.AppListApi.post)
+        assert isinstance(response, tuple)
+        assert response[1] == 201
+        assert boundary.calls == [
+            ("create", CONTEXT, CreateAppParams(mode="workflow", name=expected_name, prompt=expected_prompt))
+        ]
 
     @staticmethod
     def test_list_parses_repeated_filters_and_serializes_materialized_page(app: Flask, boundary: AppBoundary) -> None:
@@ -1576,8 +1661,9 @@ class TestConsoleAppApiCases:
             injector(None, app_id=_CONSOLE_APP_API_APP_ID)
 
     @staticmethod
+    @pytest.mark.parametrize("builder_enabled", [True, False])
     def test_create_quota_is_part_of_admission_and_precedes_application_call(
-        app: Flask, boundary: AppBoundary, monkeypatch: pytest.MonkeyPatch
+        app: Flask, boundary: AppBoundary, monkeypatch: pytest.MonkeyPatch, builder_enabled: bool
     ) -> None:
         from services.entities.feature_entities import FeatureModel, LimitationModel
 
@@ -1585,7 +1671,9 @@ class TestConsoleAppApiCases:
         account.role = TenantAccountRole.EDITOR
         account.id = CONTEXT.account_id
         identity = AccountWithTenant(account=account, tenant_id=CONTEXT.active_workspace_id)
-        apply_config_overrides(monkeypatch, DEPLOYMENT_EDITION="CLOUD", RBAC_ENABLED=False)
+        apply_config_overrides(
+            monkeypatch, DEPLOYMENT_EDITION="CLOUD", RBAC_ENABLED=False, DIFY_BUILDER_ENABLED=builder_enabled
+        )
         monkeypatch.setattr(flask_admission, "current_account_with_tenant", lambda: identity)
         monkeypatch.setattr("controllers.console.wraps.current_account_with_tenant", lambda: identity)
         monkeypatch.setattr(flask_admission, "enforce_rbac_checks", lambda **_kwargs: None)
@@ -1614,9 +1702,6 @@ class TestConsoleAppApiCases:
         assert boundary.calls == []
 
 
-"""Regression tests for CreateAppPayload mode validation."""
-
-
 class TestCreateAppPayloadCases:
     class TestCreateAppPayloadMode:
         @pytest.mark.parametrize(
@@ -1634,3 +1719,24 @@ class TestCreateAppPayloadCases:
         def test_rejects_unknown_mode(self):
             with pytest.raises(ValidationError):
                 CreateAppPayload.model_validate({"name": "X", "mode": "not-a-mode"})
+
+
+class TestCreateAppPayloadNaming:
+    """App Builder creates from a prompt, so the client may send no name."""
+
+    def test_accepts_a_prompt_without_a_name(self):
+        payload = CreateAppPayload.model_validate(
+            {"mode": "workflow", "prompt": "Refund approval for ecommerce orders"}
+        )
+        assert payload.name is None
+        assert payload.prompt == "Refund approval for ecommerce orders"
+
+    def test_accepts_neither_name_nor_prompt(self):
+        payload = CreateAppPayload.model_validate({"mode": "workflow"})
+        assert payload.name is None
+        assert payload.prompt is None
+
+    def test_still_rejects_an_empty_name(self):
+        # Omitting the name asks the server to derive one; sending "" is a bug.
+        with pytest.raises(ValidationError):
+            CreateAppPayload.model_validate({"name": "", "mode": "workflow"})

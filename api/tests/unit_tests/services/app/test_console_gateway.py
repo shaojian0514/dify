@@ -14,6 +14,7 @@ from sqlalchemy import Engine, event, select
 from sqlalchemy.exc import InvalidRequestError
 from sqlalchemy.orm import Session, sessionmaker
 
+from constants.model_template import default_app_templates
 from core.plugin.entities.plugin import PluginDependency, PluginInstallation
 from core.plugin.impl.plugin import PluginInstaller
 from enums import CloudPlan, DeploymentEdition
@@ -32,7 +33,7 @@ from models.agent import (
     WorkflowAgentNodeBinding,
 )
 from models.agent_config_entities import AgentSoulConfig
-from models.model import App, AppMode, AppModelConfig, IconType
+from models.model import App, AppMode, AppModelConfig, IconType, Site
 from models.workflow import Workflow, WorkflowType
 from repositories.app.export_repository import AppExportRepository
 from services.agent.dsl_entities import AGENT_PACKAGE_REF_KEY
@@ -47,10 +48,7 @@ from services.app.export_service import AppExportService
 from services.app_dsl_service import AppDslService
 from services.app_package_service import AppPackageService, PreparedAppPackage
 from services.enterprise.enterprise_service import EnterpriseService, WebAppSettings
-from services.entities.app_entities import (
-    AppExportOptions,
-    CopyAppParams,
-)
+from services.entities.app_entities import AppCreationSettings, AppExportOptions, CopyAppParams, CreateAppParams
 from services.entities.dsl_entities import (
     AppDslExportData,
     AppImportPackage,
@@ -59,6 +57,7 @@ from services.entities.dsl_entities import (
     Import,
     ImportStatus,
 )
+from services.evaluation_service import EvaluationService
 from services.plugin.dependencies_analysis import DependenciesAnalysisService
 from services.recommended_app_package_service import RecommendedAppPackageService
 from services.system_feature_service import SystemFeatureService
@@ -66,6 +65,7 @@ from services.workflow_service import WorkflowService
 from tests.helpers.unit.audio_runtime_fixtures import record_calls
 from tests.helpers.unit.model_factories import make_account, make_tenant, make_upload_file
 from tests.helpers.unit.rbac_fakes import RBACDomain
+from tests.workflow_empty_draft_test_utils import EmptyDraftDatabase
 
 
 @pytest.mark.parametrize(("mode", "include_inline"), [(AppMode.WORKFLOW, False), (AppMode.ADVANCED_CHAT, True)])
@@ -297,6 +297,31 @@ def copy_connections(sqlite_engine: Engine) -> Iterator[set[object]]:
     finally:
         event.remove(sqlite_engine, "checkout", checkout)
         event.remove(sqlite_engine, "checkin", checkin)
+
+
+def test_create_from_prompt_uses_derived_name_in_app_and_site(
+    sqlite_session_factory: sessionmaker[Session],
+    copy_source: tuple[RequestContext, str],
+) -> None:
+    context, _ = copy_source
+    gateway = AppLifecycleGateway(
+        session_factory=sqlite_session_factory,
+        stage_evaluation_cleanup=EvaluationService.stage_target_evaluation_cleanup,
+    )
+    app = gateway.create(
+        context,
+        CreateAppParams(mode="workflow", prompt="Refund approval for ecommerce orders"),
+        AppCreationSettings(app=dict(default_app_templates[AppMode.WORKFLOW]["app"]), model_config=None),
+    )
+
+    assert app.name == "Refund approval for ecommerce"
+    with sqlite_session_factory() as session:
+        stored = session.get(App, app.id)
+        assert stored is not None
+        assert stored.name == app.name
+        site = session.scalar(select(Site).where(Site.app_id == app.id))
+        assert site is not None
+        assert site.title == app.name
 
 
 @pytest.mark.parametrize("status", list(ImportStatus))
@@ -800,6 +825,7 @@ def test_import_forwards_preserve_agent_bindings_per_entry(
 
 @pytest.mark.parametrize("mode", [AppMode.WORKFLOW, AppMode.ADVANCED_CHAT])
 def test_create_draft_saves_the_starter_graph_of_the_apps_mode(
+    sqlite_session: Session,
     sqlite_session_factory: sessionmaker[Session],
     copy_source: tuple[RequestContext, str],
     monkeypatch: pytest.MonkeyPatch,
@@ -815,9 +841,18 @@ def test_create_draft_saves_the_starter_graph_of_the_apps_mode(
         WorkflowService, "sync_draft_workflow", record_calls(WorkflowService.sync_draft_workflow, syncs)
     )
     # The app event handlers reach the Flask-bound database; this test only checks the saved draft.
-    monkeypatch.setattr("services.workflow_service.app_draft_workflow_was_synced", Namespace().signal("synced"))
+    monkeypatch.setattr(
+        "services.workflow.draft_coordination_service.app_draft_workflow_was_synced", Namespace().signal("synced")
+    )
+    monkeypatch.setattr(
+        "services.workflow.draft_coordination_service.db",
+        EmptyDraftDatabase(sqlite_session),
+    )
 
-    AppLifecycleGateway(session_factory=sqlite_session_factory).create_draft(context, app_id)
+    AppLifecycleGateway(
+        session_factory=sqlite_session_factory,
+        stage_evaluation_cleanup=EvaluationService.stage_target_evaluation_cleanup,
+    ).create_draft(context, app_id)
 
     assert [sync["graph"] for sync in syncs] == [console_gateway._STARTER_DRAFT_GRAPHS[mode]]
     assert syncs[0]["graph"] is not console_gateway._STARTER_DRAFT_GRAPHS[mode]

@@ -2,6 +2,7 @@
 
 import type { AppPartial, UpdateAppPayload } from '@dify/contracts/api/console/apps/types.gen'
 import type { HotkeyChord } from '@tanstack/react-hotkeys'
+import type { ReactNode } from 'react'
 import type { IconPickerInputValue, IconPickerValue } from '@/app/components/base/icon-picker'
 import { Button } from '@langgenius/dify-ui/button'
 import {
@@ -28,7 +29,7 @@ import {
 import { Switch } from '@langgenius/dify-ui/switch'
 import { Textarea } from '@langgenius/dify-ui/textarea'
 import { formatForDisplay, matchesKeyboardEvent } from '@tanstack/react-hotkeys'
-import { useQuery, useSuspenseQuery } from '@tanstack/react-query'
+import { useQuery } from '@tanstack/react-query'
 import { useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
@@ -38,7 +39,7 @@ import {
   IconPickerTrigger,
 } from '@/app/components/base/icon-picker'
 import AppsFull from '@/app/components/billing/apps-full-in-dialog'
-import { systemFeaturesQueryOptions } from '@/features/system-features/client'
+import { getCountQuota, isQuotaReached } from '@/app/components/billing/quota'
 import { consoleQuery } from '@/service/console'
 
 const SUBMIT_APP_HOTKEY = 'Mod+Enter' satisfies HotkeyChord
@@ -60,6 +61,8 @@ type AppMetadataFormProps = {
   nameInputRef: React.RefObject<HTMLInputElement | null>
   isPending: boolean
   error?: string
+  title?: string
+  children?: ReactNode
   onSubmit: (body: UpdateAppPayload) => void
 }
 
@@ -70,29 +73,22 @@ export function AppMetadataForm({
   isPending,
   onSubmit,
   error,
+  title,
+  children,
 }: AppMetadataFormProps) {
   const { t } = useTranslation(['app', 'common', 'explore'])
   const formRef = useRef<HTMLFormElement>(null)
   const [source] = useState(appDetail)
   const [selectedIcon, setSelectedIcon] = useState<IconPickerValue | null>(null)
-  const { data: deploymentEdition } = useSuspenseQuery({
-    ...systemFeaturesQueryOptions(),
-    select: (data) => data.deployment_edition,
-  })
   const isEdit = operation === 'edit'
   const { data: quota } = useQuery(
     consoleQuery.features.get.queryOptions({
-      enabled: !isEdit && deploymentEdition === 'CLOUD',
-      select: (data) => data.apps,
+      enabled: !isEdit,
+      select: (data) => getCountQuota(data.apps),
     }),
   )
-  const quotaUnavailable = !isEdit && deploymentEdition === 'CLOUD' && !quota
-  const isFull =
-    !isEdit &&
-    deploymentEdition === 'CLOUD' &&
-    !!quota &&
-    quota.limit > 0 &&
-    quota.size >= quota.limit
+  const quotaUnavailable = !isEdit && !quota
+  const isFull = !isEdit && !!quota && isQuotaReached(quota)
   const icon: IconPickerInputValue | undefined =
     selectedIcon ??
     (source.icon_type === 'image' && source.icon
@@ -155,11 +151,12 @@ export function AppMetadataForm({
     >
       <DialogHeader>
         <DialogTitle>
-          {isEdit
-            ? t(($) => $.editAppTitle, { ns: 'app' })
-            : operation === 'duplicate'
-              ? t(($) => $.duplicateTitle, { ns: 'app' })
-              : t(($) => $['appCustomize.title'], { ns: 'explore', name: source.name })}
+          {title ??
+            (isEdit
+              ? t(($) => $.editAppTitle, { ns: 'app' })
+              : operation === 'duplicate'
+                ? t(($) => $.duplicateTitle, { ns: 'app' })
+                : t(($) => $['appCustomize.title'], { ns: 'explore', name: source.name }))}
         </DialogTitle>
         <DialogHeaderCloseButton
           disabled={isPending}
@@ -167,6 +164,7 @@ export function AppMetadataForm({
         />
       </DialogHeader>
       <DialogBody className="flex flex-col gap-4">
+        {children}
         <Fieldset className="grid grid-cols-[auto_minmax(0,1fr)] items-center gap-x-2 gap-y-1">
           <FieldsetLegend className="col-span-2 mb-0">
             {t(($) => $['newApp.captionName'], { ns: 'app' })}

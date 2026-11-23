@@ -15,7 +15,7 @@ import {
 } from '@/config'
 import { MARKETPLACE_API_PREFIX } from '@/features/marketplace/api'
 import { shouldSuppressAppDeletionErrorToast } from './app-deletion'
-import { httpErrorFromResponse, isHttpErrorStatus } from './http-error'
+import { getHttpErrorBodyMessage, httpErrorFromResponse, isHttpErrorStatus } from './http-error'
 import { clearRequestErrorToasts, notifyRequestError } from './request-error-toast'
 import { captureRequestGuard } from './request-guard'
 import { getWebAppPublicApiPath, resolveWebAppAddress } from './webapp-address'
@@ -64,9 +64,7 @@ const afterResponseErrorCode = (
         !otherOptions.silent &&
         !shouldSuppressAppDeletionErrorToast(request.url, response.status)
 
-      const errorMessage = [errorData?.message, errorData?.error].find(
-        (value): value is string => typeof value === 'string' && !!value.trim(),
-      )
+      const errorMessage = getHttpErrorBodyMessage(errorData)
       if (shouldNotifyError && errorMessage) notifyRequestError(request, errorMessage)
 
       if (response.status === 403 && errorData?.code === 'already_setup')
@@ -184,6 +182,7 @@ async function base<T>(
     },
   })
 
+  // Preserve the original body for the retry after an authentication refresh.
   const res = await client(request ? request.clone() : fetchPathname, {
     ...init,
     headers,

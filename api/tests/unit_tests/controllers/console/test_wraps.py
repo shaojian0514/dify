@@ -8,8 +8,8 @@ from flask import Blueprint, Flask
 from flask_login import LoginManager, UserMixin
 from flask_restx import Api, Namespace, Resource
 from pydantic import BaseModel
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy import Engine, event, insert, select
+from sqlalchemy.orm import Session, scoped_session, sessionmaker
 from werkzeug.exceptions import HTTPException
 
 from controllers.common.rbac import RBAC_CHECKS_ATTR, DatasetId, PlainApp, RBACCheck, Workspace
@@ -47,7 +47,7 @@ from controllers.console.wraps import (
     with_current_user,
     with_current_user_id,
 )
-from enums import DeploymentEdition
+from enums import CloudPlan, DeploymentEdition
 from libs.external_api import ExternalApi, register_external_error_handlers
 from libs.login import AccountWithTenant
 from machinery.context import RequestContext
@@ -57,8 +57,8 @@ from models.account import AccountStatus, TenantAccountRole
 from models.dataset import RateLimitLog
 from services.entities.feature_entities import LicenseStatus
 from services.errors.billing import BillingUpstreamUnavailableError
-from tests.helpers import billing_builders as builders
 from tests.helpers.unit.config_override import config_overrides_context
+from tests.unit_tests.database_fixtures import BoundDatabase
 
 
 @pytest.fixture(autouse=True)
@@ -226,6 +226,52 @@ class TestCurrentContextInjection:
         setup_required.assert_called_once()
         login_required.assert_called_once()
         account_initialization_required.assert_called_once()
+
+    @pytest.mark.parametrize(
+        ("status", "admitted"),
+        [(AccountStatus.ACTIVE, True), (AccountStatus.UNINITIALIZED, False)],
+    )
+    def test_console_account_admission_without_active_workspace(self, status: AccountStatus, admitted: bool):
+        current_user = make_account()
+        current_user.status = status
+
+        with (
+            patch("controllers.console.flask_admission.setup_required", side_effect=lambda view: view),
+            patch("controllers.console.flask_admission.login_required", side_effect=lambda view: view),
+            patch(
+                "controllers.console.flask_admission.account_initialization_required", side_effect=lambda view: view
+            ) as account_initialization_required,
+            patch(
+                "controllers.console.flask_admission.current_account_with_tenant_optional",
+                return_value=(current_user, None),
+            ),
+            patch("controllers.console.flask_admission.current_account_with_tenant") as with_tenant,
+            patch("controllers.console.flask_admission.get_request_id", return_value="request-1"),
+            patch("controllers.console.flask_admission.get_trace_id", return_value="trace-1"),
+        ):
+
+            class Handler:
+                @flask_admission.console_account_admission(require_active_workspace=False)
+                def get(self, request_context: RequestContext):
+                    return request_context
+
+            with Flask(__name__).test_request_context():
+                if admitted:
+                    result = Handler().get()
+                    assert result.account_id == current_user.id
+                    assert result.active_workspace_id == ""
+                else:
+                    with pytest.raises(AccountNotInitializedError):
+                        Handler().get()
+
+        with_tenant.assert_not_called()
+        account_initialization_required.assert_not_called()
+
+    def test_console_account_admission_without_active_workspace_rejects_role_checks(self):
+        with pytest.raises(ValueError, match="active workspace"):
+            flask_admission.console_account_admission(
+                require_active_workspace=False, allowed_roles=frozenset({TenantAccountRole.OWNER})
+            )
 
     def test_console_email_registration_admission_checks_features_once(self):
         with (
@@ -846,43 +892,41 @@ class TestEditionChecks:
 
 
 class TestBillingPaidPlanRequired:
-    @pytest.mark.parametrize("plan", ["professional", "team"])
-    def test_should_allow_paid_plan(self, plan: str):
+    @pytest.mark.parametrize("plan", [CloudPlan.PROFESSIONAL, CloudPlan.TEAM])
+    def test_should_allow_paid_plan(self, plan: CloudPlan):
         @cloud_edition_billing_paid_plan_required
         def paid_view():
             return "paid_success"
 
-        billing_info = builders.subscription_info(plan)
         with (
             patch(
                 "controllers.console.wraps.current_account_with_tenant",
                 return_value=(MockUser("test_user"), "tenant123"),
             ),
-            patch("controllers.console.wraps.BillingService.get_info", return_value=billing_info) as get_info,
+            patch(
+                "controllers.console.wraps.FeatureService.get_workspace_plan", return_value=plan
+            ) as get_workspace_plan,
         ):
             result = paid_view()
 
         assert result == "paid_success"
-        get_info.assert_called_once_with("tenant123", exclude_vector_space=True)
+        get_workspace_plan.assert_called_once_with("tenant123")
 
-    @pytest.mark.parametrize("plan", ["sandbox", "unknown"])
-    def test_should_reject_non_paid_plan(self, plan: str):
+    @pytest.mark.parametrize("plan", [CloudPlan.SANDBOX, None])
+    def test_should_reject_non_paid_plan(self, plan: CloudPlan | None):
         app = create_app_with_login()
 
         @cloud_edition_billing_paid_plan_required
         def paid_view():
             return "paid_success"
 
-        billing_info = builders.subscription_info(
-            subscription=builders.subscription_plan().model_copy(update={"plan": plan})
-        )
         with app.test_request_context():
             with (
                 patch(
                     "controllers.console.wraps.current_account_with_tenant",
                     return_value=(MockUser("test_user"), "tenant123"),
                 ),
-                patch("controllers.console.wraps.BillingService.get_info", return_value=billing_info),
+                patch("controllers.console.wraps.FeatureService.get_workspace_plan", return_value=plan),
                 pytest.raises(HTTPException) as exc_info,
             ):
                 paid_view()
@@ -904,7 +948,7 @@ class TestBillingPaidPlanRequired:
                     return_value=(MockUser("test_user"), "tenant123"),
                 ),
                 patch(
-                    "controllers.console.wraps.BillingService.get_info",
+                    "controllers.console.wraps.FeatureService.get_workspace_plan",
                     side_effect=BillingUpstreamUnavailableError("billing unavailable"),
                 ),
                 pytest.raises(HTTPException) as exc_info,
@@ -928,13 +972,13 @@ class TestBillingPaidPlanRequired:
                 return_value=(MockUser("test_user"), "tenant123"),
             ),
             patch(
-                "controllers.console.wraps.BillingService.get_info",
-                return_value=builders.subscription_info(plan),
-            ) as get_info,
+                "controllers.console.wraps.FeatureService.get_workspace_plan",
+                return_value=CloudPlan(plan),
+            ) as get_workspace_plan,
         ):
             assert evaluation_view() == "allowed"
 
-        get_info.assert_called_once_with("tenant123", exclude_vector_space=True)
+        get_workspace_plan.assert_called_once_with("tenant123")
 
     def test_evaluation_guard_rejects_cloud_sandbox(self, config_overrides: Callable[..., None]) -> None:
         config_overrides(DEPLOYMENT_EDITION=DeploymentEdition.CLOUD)
@@ -949,8 +993,8 @@ class TestBillingPaidPlanRequired:
                 return_value=(MockUser("test_user"), "tenant123"),
             ),
             patch(
-                "controllers.console.wraps.BillingService.get_info",
-                return_value=builders.subscription_info("sandbox"),
+                "controllers.console.wraps.FeatureService.get_workspace_plan",
+                return_value=CloudPlan.SANDBOX,
             ),
             pytest.raises(HTTPException) as exc_info,
         ):
@@ -970,9 +1014,11 @@ class TestBillingPaidPlanRequired:
         with (
             patch(
                 "controllers.console.wraps.current_account_with_tenant",
-                side_effect=AssertionError("no tenant lookup"),
+                return_value=(MockUser("test_user"), "tenant123"),
             ),
-            patch("controllers.console.wraps.BillingService.get_info", side_effect=AssertionError("no billing")),
+            patch(
+                "controllers.console.wraps.FeatureService.get_workspace_plan", side_effect=AssertionError("no billing")
+            ),
         ):
             assert evaluation_view() == "allowed"
 
@@ -989,7 +1035,7 @@ class TestBillingPaidPlanRequired:
                 return_value=(MockUser("test_user"), "tenant123"),
             ),
             patch(
-                "controllers.console.wraps.BillingService.get_info",
+                "controllers.console.wraps.FeatureService.get_workspace_plan",
                 side_effect=BillingUpstreamUnavailableError("billing unavailable"),
             ),
             pytest.raises(HTTPException) as exc_info,
@@ -1020,8 +1066,8 @@ class TestBillingPaidPlanRequired:
                 return_value=(MockUser("test_user"), "tenant123"),
             ),
             patch(
-                "controllers.console.wraps.BillingService.get_info",
-                return_value=builders.subscription_info("sandbox"),
+                "controllers.console.wraps.FeatureService.get_workspace_plan",
+                return_value=CloudPlan.SANDBOX,
             ),
         ):
             response = app.test_client().get("/check/evaluation")
@@ -1361,6 +1407,77 @@ class TestSystemSetup:
         with patch("controllers.console.wraps.db.session", sqlite_session):
             with pytest.raises(NotSetupError):
                 admin_view()
+
+    @staticmethod
+    def _request_session(
+        sqlite_session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+    ) -> scoped_session[Session]:
+        """The request-scoped ``db.session`` the wrapped view and later wrappers share."""
+        registry = scoped_session(sqlite_session_factory)
+        monkeypatch.setattr(wraps_module, "db", BoundDatabase(registry))
+        return registry
+
+    @pytest.mark.parametrize("complete", [True, False], ids=["complete", "missing"])
+    def test_uncached_setup_read_leaves_no_request_transaction(
+        self,
+        sqlite_session_factory: sessionmaker[Session],
+        sqlite_engine: Engine,
+        monkeypatch: pytest.MonkeyPatch,
+        complete: bool,
+    ) -> None:
+        """The setup read ends before the wrapped view and the later wrappers' external checks."""
+        if complete:
+            with sqlite_session_factory.begin() as session:
+                session.add(DifySetup(version="1.0"))
+        registry = self._request_session(sqlite_session_factory, monkeypatch)
+        opened: list[int] = []
+        event.listen(sqlite_engine, "begin", lambda _conn: opened.append(1))
+        event.listen(sqlite_engine, "commit", lambda _conn: opened.append(-1))
+        event.listen(sqlite_engine, "rollback", lambda _conn: opened.append(-1))
+        observed: list[tuple[bool, int]] = []
+
+        @setup_required
+        def admin_view() -> str:
+            observed.append((registry().in_transaction(), max(0, sum(opened))))
+            return "admin_success"
+
+        if complete:
+            assert admin_view() == "admin_success"
+            assert observed == [(False, 0)]
+        else:
+            with pytest.raises(NotSetupError):
+                admin_view()
+        assert not registry().in_transaction()
+        assert max(0, sum(opened)) == 0
+        registry.remove()
+
+    @pytest.mark.parametrize("write", ["orm_flushed", "core_dml"])
+    def test_setup_read_never_touches_a_callers_request_transaction(
+        self, sqlite_session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch, write: str
+    ) -> None:
+        """A request transaction already holding another owner's write is left exactly as it was."""
+        with sqlite_session_factory.begin() as session:
+            session.add(DifySetup(version="1.0"))
+        registry = self._request_session(sqlite_session_factory, monkeypatch)
+        scoped = registry()
+        if write == "orm_flushed":
+            scoped.add(DifySetup(version="caller-write"))
+            scoped.flush()
+        else:
+            scoped.execute(insert(DifySetup).values(version="caller-write"))
+
+        @setup_required
+        def admin_view() -> str:
+            return "admin_success"
+
+        assert admin_view() == "admin_success"
+        staged = select(DifySetup.version).where(DifySetup.version == "caller-write")
+        assert scoped.in_transaction()
+        assert scoped.scalar(staged) == "caller-write"
+        with sqlite_session_factory() as other:
+            assert other.scalar(staged) is None
+        scoped.rollback()
+        registry.remove()
 
 
 class TestEnterpriseLicense:
